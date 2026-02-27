@@ -4,6 +4,13 @@
     "id": "Microsoft.Azure.Functions.ExtensionBundle",
     "version": "[4.*, 5.0.0)"
   },
+  "extensions": {
+    "queues": {
+      "messageEncoding": "none",
+      "maxDequeueCount": 5,
+      "visibilityTimeout": "00:10:00"
+    }
+  },
   "logging": {
     "logLevel": {
       "default": "Information",
