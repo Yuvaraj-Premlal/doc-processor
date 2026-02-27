@@ -80,7 +80,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
 
 # --- Worker (Queue Trigger) ---
 @app.function_name(name="job_worker")
-@app.queue_trigger(arg_name="msg", queue_name="%JOBS_QUEUE%", connection="AzureWebJobsStorage")
+@app.queue_trigger(arg_name="msg", queue_name="jobs", connection="AzureWebJobsStorage")
 def job_worker(msg: func.QueueMessage) -> None:
     # For Step 10 v1: just log the message and write a status marker to results/<jobId>/status.json
     raw = msg.get_body().decode("utf-8")
