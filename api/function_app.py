@@ -652,14 +652,21 @@ def job_worker(msg: func.QueueMessage) -> None:
         print(f"[worker][ERROR] {str(e)}")
         write_status("failed", {"error": str(e)})
         return
-# =========================
-# HTTP: Get UI-friendly job output
+# =========================# ========================= works until here======
+# HTTP: Get UI-friendly job output (clean JSON for frontend)
 # =========================
 @app.route(route="job/{jobId}/ui", methods=["GET"])
 def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
     job_id = req.route_params.get("jobId")
 
     try:
+        if not job_id:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing jobId"}),
+                status_code=400,
+                mimetype="application/json",
+            )
+
         results_container = os.environ.get("RESULTS_CONTAINER", "results")
         rc = blob_service().get_container_client(results_container)
 
@@ -668,31 +675,38 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
 
         if not blob_client.exists():
             return func.HttpResponse(
-                json.dumps({"error": "Not ready"}),
+                json.dumps({"error": "Not ready or invalid jobId"}),
                 status_code=404,
-                mimetype="application/json"
+                mimetype="application/json",
             )
 
         data = json.loads(blob_client.download_blob().readall())
 
-        # ---- Simplify + remove geometry ----
+        # ---- Simplify + remove geometry/DI wrapper fields ----
         def simplify(value):
             if isinstance(value, dict):
-
                 # unwrap DI typed fields
                 if "valueString" in value:
                     return value["valueString"]
                 if "valueNumber" in value:
                     return value["valueNumber"]
                 if "valueArray" in value:
-                    return [simplify(v.get("valueObject", v)) for v in value["valueArray"]]
+                    # valueArray items often are {"type": "...", "valueObject": {...}}
+                    out = []
+                    for item in value["valueArray"]:
+                        if isinstance(item, dict) and "valueObject" in item:
+                            out.append(simplify(item["valueObject"]))
+                        else:
+                            out.append(simplify(item))
+                    return out
                 if "valueObject" in value:
                     return {k: simplify(v) for k, v in value["valueObject"].items()}
 
-                # remove geometry
+                # drop geometry/noisy keys
+                drop_keys = {"boundingRegions", "polygon", "spans", "content"}
                 clean = {}
                 for k, v in value.items():
-                    if k in ["boundingRegions", "polygon", "spans", "content"]:
+                    if k in drop_keys:
                         continue
                     clean[k] = simplify(v)
                 return clean
@@ -706,61 +720,20 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
             "jobId": data.get("jobId"),
             "pickedPages": data.get("pickedPages"),
             "confidence": data.get("confidence"),
-            "ceva": simplify(data.get("ceva")),
-            "entry_summary": simplify(data.get("entry_summary")),
-            "parts_worksheet": simplify(data.get("parts_worksheet")),
+            "ceva": simplify(data.get("ceva") or {}),
+            "entry_summary": simplify(data.get("entry_summary") or {}),
+            "parts_worksheet": simplify(data.get("parts_worksheet") or {}),
         }
 
         return func.HttpResponse(
             json.dumps(ui),
             status_code=200,
-            mimetype="application/json"
+            mimetype="application/json",
         )
 
     except Exception as e:
         return func.HttpResponse(
             json.dumps({"error": str(e)}),
             status_code=500,
-            mimetype="application/json"
+            mimetype="application/json",
         )
-# =========================
-# UI Endpoint
-# Returns clean JSON for frontend
-# =========================
-@app.route(route="job/{jobId}/ui", methods=["GET"])
-def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        job_id = req.route_params.get("jobId")
-        if not job_id:
-            return func.HttpResponse("Missing jobId", status_code=400)
-
-        results_container = os.environ.get("RESULTS_CONTAINER", "results")
-        bsc = blob_service()
-        rc = bsc.get_container_client(results_container)
-
-        table_blob_path = f"{job_id}/table.json"
-
-        blob_client = rc.get_blob_client(table_blob_path)
-
-        if not blob_client.exists():
-            return func.HttpResponse("Not ready", status_code=404)
-
-        table_data = json.loads(
-            blob_client.download_blob().readall()
-        )
-
-        # Only send clean sections (ignore geometry/raw/etc.)
-        clean_output = {
-            "jobId": table_data.get("jobId"),
-            "ceva": table_data.get("ceva", {}),
-            "entry_summary": table_data.get("entry_summary", {}),
-            "parts_worksheet": table_data.get("parts_worksheet", {})
-        }
-
-        return func.HttpResponse(
-            json.dumps(clean_output),
-            mimetype="application/json"
-        )
-
-    except Exception as e:
-        return func.HttpResponse(str(e), status_code=500)
