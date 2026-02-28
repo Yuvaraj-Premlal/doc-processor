@@ -3,3 +3,4 @@ azure-storage-blob
 azure-storage-queue
 azure-ai-documentintelligence
 azure-core
+pypdf
