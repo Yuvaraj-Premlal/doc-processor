@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 import base64
+import io
 from datetime import datetime, timezone
 
 from azure.storage.blob import BlobServiceClient
@@ -10,6 +11,9 @@ from azure.storage.queue import QueueClient
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
+
+# PDF diagnostics (make sure `pypdf` is in requirements.txt)
+from pypdf import PdfReader
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -19,17 +23,18 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 # Helpers
 # =========================
 
-def utc_now_iso():
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def blob_service():
+def blob_service() -> BlobServiceClient:
     return BlobServiceClient.from_connection_string(os.environ["AzureWebJobsStorage"])
 
 
-def queue_client():
+def queue_client() -> QueueClient:
+    # Hardcoded to avoid extra configuration
     conn = os.environ["AzureWebJobsStorage"]
-    qname = "jobs"  # hardcoded to avoid extra config
+    qname = "jobs"
     qc = QueueClient.from_connection_string(conn, qname)
     try:
         qc.create_queue()
@@ -38,17 +43,14 @@ def queue_client():
     return qc
 
 
-def di_client():
+def di_client() -> DocumentIntelligenceClient:
     endpoint = os.environ["DI_ENDPOINT"]
     key = os.environ["DI_KEY"]
-    return DocumentIntelligenceClient(
-        endpoint=endpoint,
-        credential=AzureKeyCredential(key)
-    )
+    return DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
 
 
 def _jsonable(obj):
-    """Convert SDK objects to JSON-serializable structure."""
+    """Convert SDK objects to JSON-serializable structure (best-effort)."""
     if obj is None:
         return None
     if isinstance(obj, (str, int, float, bool)):
@@ -75,6 +77,15 @@ def _jsonable(obj):
     return str(obj)
 
 
+def safe_filename(s: str) -> str:
+    s = (s or "").strip().replace(" ", "_")
+    keep = []
+    for ch in s:
+        if ch.isalnum() or ch in ("_", "-", "."):
+            keep.append(ch)
+    return "".join(keep) or "UNKNOWN"
+
+
 # =========================
 # HTTP Upload Endpoint
 # =========================
@@ -86,7 +97,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({"error": "Send multipart/form-data with field name 'files'."}),
                 status_code=400,
-                mimetype="application/json"
+                mimetype="application/json",
             )
 
         files = req.files.getlist("files")
@@ -94,7 +105,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({"error": "No files uploaded. Use field name 'files'."}),
                 status_code=400,
-                mimetype="application/json"
+                mimetype="application/json",
             )
 
         job_id = str(uuid.uuid4())
@@ -116,40 +127,33 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
             filename = getattr(f, "filename", "file.pdf")
             blob_path = f"{job_id}/original/{filename}"
 
-            f.stream.seek(0)                 # important
-            data = f.stream.read()           # read full file
+            # IMPORTANT: read full bytes (avoids truncated uploads)
+            f.stream.seek(0)
+            data = f.stream.read()
             container.upload_blob(blob_path, data, overwrite=True)
-            uploaded.append({"file": filename, "blob": blob_path})
-    # optional debug:
-            print(f"[upload] {filename} bytes={len(data)}")
-            msg = {
-                "jobId": job_id,
-                "pdfBlobPath": blob_path,
-                "fileName": filename
-            }
+            print(f"[upload] uploaded {filename} bytes={len(data)}")
 
+            uploaded.append({"file": filename, "blob": blob_path})
+
+            msg = {"jobId": job_id, "pdfBlobPath": blob_path, "fileName": filename}
             qc.send_message(json.dumps(msg))
             enqueued.append(msg)
 
         return func.HttpResponse(
-            json.dumps({
-                "jobId": job_id,
-                "files": uploaded,
-                "queued": enqueued
-            }),
-            mimetype="application/json"
+            json.dumps({"jobId": job_id, "files": uploaded, "queued": enqueued}),
+            mimetype="application/json",
         )
 
     except Exception as e:
         return func.HttpResponse(
             json.dumps({"error": str(e)}),
             status_code=500,
-            mimetype="application/json"
+            mimetype="application/json",
         )
 
 
 # =========================
-# Queue Worker
+# Queue Worker: Classify + write classification.json
 # =========================
 
 @app.function_name(name="job_worker")
@@ -159,7 +163,6 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
     connection="AzureWebJobsStorage",
 )
 def job_worker(msg: func.QueueMessage) -> None:
-
     raw = msg.get_body().decode("utf-8")
 
     try:
@@ -186,44 +189,49 @@ def job_worker(msg: func.QueueMessage) -> None:
 
     status_blob = f"{job_id}/status.json"
 
-    def write_status(stage, extra=None):
+    def write_status(stage: str, extra: dict | None = None):
         status = {
             "jobId": job_id,
             "stage": stage,
             "pdfBlobPath": pdf_blob_path,
-            "updatedAt": utc_now_iso()
+            "updatedAt": utc_now_iso(),
         }
         if extra:
             status.update(extra)
-
         rc.upload_blob(status_blob, json.dumps(status), overwrite=True)
         print(f"[worker] status => {stage}")
 
     try:
-        # 1️⃣ Mark as classifying
         write_status("classifying")
 
-        # 2️⃣ Download PDF
         if not pdf_blob_path:
             raise ValueError("pdfBlobPath missing in queue payload.")
 
+        # 1) Download PDF bytes
         pdf_bytes = uc.get_blob_client(pdf_blob_path).download_blob().readall()
         print(f"[worker] Downloaded PDF size: {len(pdf_bytes)} bytes")
 
-        # 3️⃣ Call Azure Document Intelligence classifier
-        classifier_id = "cevadocclassifier"
+        # 2) PROOF: page count + page1 text length (native PDF should show text_len > 0)
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages_in_pdf = len(reader.pages)
+        page1_text_len = len(((reader.pages[0].extract_text() or "").strip()) if pages_in_pdf > 0 else "")
+        print(f"[worker] pages_in_pdf={pages_in_pdf} page1_text_len={page1_text_len}")
+
+        # 3) Call Azure Document Intelligence classifier
+        classifier_id = "cevadocclassifier"  # <-- your real classifier ID from Studio
         client = di_client()
 
+        # IMPORTANT: pass content_type for consistent PDF handling
         poller = client.begin_classify_document(
             classifier_id,
-            body=pdf_bytes
+            body=pdf_bytes,
+            content_type="application/pdf",
         )
         result = poller.result()
-        
-      
-        # 4️⃣ Simplify results
+
+        # 4) Simplify results (docType/confidence/pages via boundingRegions.pageNumber)
         simplified_docs = []
-        documents = getattr(result, "documents", []) or []
+        documents = getattr(result, "documents", None) or []
 
         for d in documents:
             doc_type = getattr(d, "doc_type", None) or getattr(d, "docType", None)
@@ -232,34 +240,39 @@ def job_worker(msg: func.QueueMessage) -> None:
             pages = []
             brs = getattr(d, "bounding_regions", None) or getattr(d, "boundingRegions", None) or []
             for br in brs:
-                page_number = getattr(br, "page_number", None) or getattr(br, "pageNumber", None)
-                if page_number:
-                    pages.append(page_number)
+                pn = getattr(br, "page_number", None) or getattr(br, "pageNumber", None)
+                if pn is not None:
+                    pages.append(int(pn))
 
             pages = sorted(set(pages)) if pages else None
 
-            simplified_docs.append({
-                "docType": doc_type,
-                "confidence": confidence,
-                "pages": pages
-            })
+            simplified_docs.append(
+                {
+                    "docType": doc_type,
+                    "confidence": confidence,
+                    "pages": pages,
+                }
+            )
 
-        # 5️⃣ Save classification.json
+        # 5) Save classification.json
         classification_blob = f"{job_id}/classification.json"
         classification_payload = {
             "jobId": job_id,
             "classifierId": classifier_id,
             "createdAt": utc_now_iso(),
+            "diagnostics": {
+                "downloadedBytes": len(pdf_bytes),
+                "pagesInPdf": pages_in_pdf,
+                "page1TextLen": page1_text_len,
+            },
             "simplified": simplified_docs,
-            "raw": _jsonable(result)
+            "raw": _jsonable(result),
         }
 
         rc.upload_blob(classification_blob, json.dumps(classification_payload), overwrite=True)
+        print(f"[worker] Wrote {results_container}/{classification_blob}")
 
-        # 6️⃣ Mark as classified
-        write_status("classified", {
-            "documentsFound": len(simplified_docs)
-        })
+        write_status("classified", {"documentsFound": len(simplified_docs)})
 
         print(f"[worker] Classification complete for job {job_id}")
 
