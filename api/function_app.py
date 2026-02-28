@@ -208,7 +208,7 @@ def job_worker(msg: func.QueueMessage) -> None:
         print(f"[worker] Downloaded PDF size: {len(pdf_bytes)} bytes")
 
         # 3️⃣ Call Azure Document Intelligence classifier
-        classifier_id = "CEVA_Document_Classification"
+        classifier_id = "cevadocclassifier"
         client = di_client()
 
         poller = client.begin_classify_document(
