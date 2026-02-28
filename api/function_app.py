@@ -12,13 +12,13 @@ from azure.storage.queue import QueueClient
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 
-# PDF split
+# PDF split/extract
 from pypdf import PdfReader, PdfWriter
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
-# Your 3 target doc types (must match your classifier's docType strings)
+# Your classifier labels (must match exactly what the classifier returns)
 TARGET_DOC_TYPES = [
     "CEVA",
     "ENTRY SUMMARY",
@@ -87,6 +87,15 @@ def normalize_doctype(s: str | None) -> str:
     return (s or "").strip().upper()
 
 
+def safe_slug(s: str) -> str:
+    s = (s or "").strip().upper().replace(" ", "_")
+    keep = []
+    for ch in s:
+        if ch.isalnum() or ch in ("_", "-", "."):
+            keep.append(ch)
+    return "".join(keep) or "UNKNOWN"
+
+
 def split_pdf_to_single_page_pdfs(pdf_bytes: bytes) -> list[dict]:
     """
     Returns a list of items:
@@ -103,6 +112,19 @@ def split_pdf_to_single_page_pdfs(pdf_bytes: bytes) -> list[dict]:
         out.append({"pageNumber": i + 1, "pdfBytes": buf.getvalue()})
 
     return out
+
+
+def extract_single_page_pdf(bundle_reader: PdfReader, page_number_1_based: int) -> bytes:
+    """Extract one page (1-based) from a PdfReader and return as PDF bytes."""
+    idx = page_number_1_based - 1
+    if idx < 0 or idx >= len(bundle_reader.pages):
+        raise ValueError(f"page {page_number_1_based} out of range (1..{len(bundle_reader.pages)})")
+
+    writer = PdfWriter()
+    writer.add_page(bundle_reader.pages[idx])
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
 
 
 # =========================
@@ -171,7 +193,9 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # =========================
-# Queue Worker: split bundle -> classify each page -> choose best page per doc type
+# Queue Worker:
+#   Bundle -> split pages -> classify each page
+#   -> best page per doc type -> save picked single-page PDFs
 # =========================
 @app.function_name(name="job_worker")
 @app.queue_trigger(
@@ -228,13 +252,15 @@ def job_worker(msg: func.QueueMessage) -> None:
         pdf_bytes = uc.get_blob_client(pdf_blob_path).download_blob().readall()
         print(f"[worker] Downloaded bundle bytes={len(pdf_bytes)}")
 
-        # 2) Split into single-page PDFs
+        bundle_reader = PdfReader(io.BytesIO(pdf_bytes))
+        total_pages = len(bundle_reader.pages)
+        print(f"[worker] Bundle pages={total_pages}")
+
+        # 2) Split into single-page PDFs (in-memory)
         pages = split_pdf_to_single_page_pdfs(pdf_bytes)
-        total_pages = len(pages)
-        print(f"[worker] Split into {total_pages} page PDFs")
 
         # 3) Classify each page
-        classifier_id = "cevadocclassifier"  # <-- your real classifier ID from Studio
+        classifier_id = "cevadocclassifier"  # your classifier ID
         client = di_client()
 
         page_results: list[dict] = []
@@ -252,7 +278,6 @@ def job_worker(msg: func.QueueMessage) -> None:
                 )
                 result = poller.result()
 
-                # Expecting one document classification for a single page input
                 docs = getattr(result, "documents", None) or []
                 if docs:
                     d0 = docs[0]
@@ -263,29 +288,18 @@ def job_worker(msg: func.QueueMessage) -> None:
                     conf = None
 
                 page_results.append(
-                    {
-                        "pageNumber": pno,
-                        "predictedDocType": doc_type,
-                        "confidence": conf,
-                    }
+                    {"pageNumber": pno, "predictedDocType": doc_type, "confidence": conf}
                 )
-
                 print(f"[worker] page={pno} => {doc_type} (conf={conf})")
 
             except Exception as e:
                 failures.append({"pageNumber": pno, "error": str(e)})
                 page_results.append(
-                    {
-                        "pageNumber": pno,
-                        "predictedDocType": None,
-                        "confidence": None,
-                        "error": str(e),
-                    }
+                    {"pageNumber": pno, "predictedDocType": None, "confidence": None, "error": str(e)}
                 )
                 print(f"[worker][WARN] page={pno} classify failed: {str(e)}")
 
-        # 4) Choose best page (max confidence) for each target doc type
-        #    (No ranges; just the single best page per class)
+        # 4) Choose best page (max confidence) for each target doc type (no ranges)
         best_pages: dict = {}
         for target in TARGET_DOC_TYPES:
             target_norm = normalize_doctype(target)
@@ -300,14 +314,13 @@ def job_worker(msg: func.QueueMessage) -> None:
             best_pages[target] = {
                 "bestPageNumber": best["pageNumber"] if best else None,
                 "bestConfidence": float(best["confidence"]) if best else None,
-                # helpful for debugging / fallback without “ranges”
                 "topPages": [
                     {"pageNumber": c["pageNumber"], "confidence": float(c["confidence"])}
                     for c in candidates[:3]
                 ],
             }
 
-        # 5) Save outputs
+        # 5) Save JSON outputs
         page_scores_blob = f"{job_id}/page_classification.json"
         best_pages_blob = f"{job_id}/best_pages.json"
 
@@ -318,6 +331,7 @@ def job_worker(msg: func.QueueMessage) -> None:
             "bundleDiagnostics": {
                 "downloadedBytes": len(pdf_bytes),
                 "totalPages": total_pages,
+                "failedPages": len(failures),
                 "failures": failures,
             },
             "pageResults": page_results,
@@ -336,15 +350,62 @@ def job_worker(msg: func.QueueMessage) -> None:
         print(f"[worker] Wrote {results_container}/{page_scores_blob}")
         print(f"[worker] Wrote {results_container}/{best_pages_blob}")
 
-        # 6) Update status
+        # 6) Extract & save the best pages as single-page PDFs
+        write_status("pages_extracting", {"totalPages": total_pages, "failedPages": len(failures)})
+
+        picked_outputs = []
+        for target in TARGET_DOC_TYPES:
+            bp = best_pages.get(target, {})
+            page_no = bp.get("bestPageNumber")
+
+            if not isinstance(page_no, int):
+                picked_outputs.append(
+                    {
+                        "docType": target,
+                        "pickedPage": None,
+                        "blob": None,
+                        "note": "No matching page found",
+                    }
+                )
+                continue
+
+            picked_pdf_bytes = extract_single_page_pdf(bundle_reader, page_no)
+
+            blob_name = f"{job_id}/picked/{safe_slug(target)}_page_{page_no}.pdf"
+            rc.upload_blob(blob_name, picked_pdf_bytes, overwrite=True)
+
+            picked_outputs.append(
+                {
+                    "docType": target,
+                    "pickedPage": page_no,
+                    "confidence": bp.get("bestConfidence"),
+                    "blob": blob_name,
+                    "bytes": len(picked_pdf_bytes),
+                }
+            )
+            print(f"[worker] Picked {target} => page {page_no} -> {results_container}/{blob_name}")
+
+        picked_blob = f"{job_id}/picked_pages.json"
+        picked_payload = {
+            "jobId": job_id,
+            "classifierId": classifier_id,
+            "createdAt": utc_now_iso(),
+            "picked": picked_outputs,
+        }
+        rc.upload_blob(picked_blob, json.dumps(picked_payload), overwrite=True)
+        print(f"[worker] Wrote {results_container}/{picked_blob}")
+
+        # 7) Final status for this step
         write_status(
-            "page_classified",
+            "pages_extracted",
             {
                 "totalPages": total_pages,
                 "targets": TARGET_DOC_TYPES,
                 "outputs": {
                     "pageClassification": f"{results_container}/{page_scores_blob}",
                     "bestPages": f"{results_container}/{best_pages_blob}",
+                    "pickedPages": f"{results_container}/{picked_blob}",
+                    "pickedPrefix": f"{results_container}/{job_id}/picked/",
                 },
                 "failedPages": len(failures),
             },
