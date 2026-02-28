@@ -1,107 +1,176 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Document Bundle Viewer</title>
-    <style>
-        body { font-family: Arial; margin: 40px; }
-        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
-        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
-        th { background: #f4f4f4; }
-        .section { margin-top: 30px; }
-        .error { color: red; font-weight: bold; }
-    </style>
+  <title>Document Bundle Viewer</title>
+  <style>
+    body { font-family: Arial; margin: 40px; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    th { background: #f4f4f4; }
+    .section { margin-top: 30px; }
+    .row { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
+    .muted { color:#666; font-size: 13px; }
+    .ok { color: #0a7a0a; font-weight: 600; }
+    .err { color: #b00020; font-weight: 600; }
+    .box { padding: 12px; border: 1px solid #ddd; border-radius: 6px; margin-bottom: 18px; }
+    button { padding: 6px 10px; cursor:pointer; }
+    input[type="text"] { padding: 6px; }
+  </style>
 </head>
 <body>
 
 <h2>Document Bundle Viewer</h2>
 
-<input type="text" id="jobIdInput" placeholder="Enter Job ID" style="width:400px;">
-<button onclick="loadJob()">Load</button>
+<!-- Upload box -->
+<div class="box">
+  <div class="row">
+    <input type="file" id="fileInput" multiple />
+    <button onclick="uploadFiles()">Upload</button>
+    <span class="muted">Upload PDF(s) or a ZIP (single bundle or multiple PDFs)</span>
+  </div>
+  <div id="uploadStatus" class="muted"></div>
+</div>
+
+<!-- Load box -->
+<div class="box">
+  <div class="row">
+    <input type="text" id="jobIdInput" placeholder="Enter Job ID" style="width:520px;">
+    <button onclick="loadJob()">Load</button>
+  </div>
+  <div id="loadStatus" class="muted"></div>
+</div>
 
 <div id="output"></div>
 
 <script>
-
-// 🔥 IMPORTANT — Your Azure Function backend URL
-const API_BASE = "https://yavi-b4bahkdqced4ayhh.canadacentral-01.azurewebsites.net";
-
-async function loadJob() {
-    const jobId = document.getElementById("jobIdInput").value.trim();
-    if (!jobId) return alert("Enter jobId");
-
-    const outputDiv = document.getElementById("output");
-    outputDiv.innerHTML = "Loading...";
-
-    try {
-        const res = await fetch(`${API_BASE}/api/job/${jobId}/ui`);
-
-        if (!res.ok) {
-            outputDiv.innerHTML = "<p class='error'>Job not ready or invalid Job ID.</p>";
-            return;
-        }
-
-        const data = await res.json();
-
-        let html = "";
-
-        // ================= CEVA =================
-        if (data.ceva) {
-            html += "<div class='section'><h3>CEVA</h3><table>";
-            for (const key in data.ceva) {
-                html += `<tr><th>${key}</th><td>${data.ceva[key] || ""}</td></tr>`;
-            }
-            html += "</table></div>";
-        }
-
-        // ================= Entry Summary =================
-        if (data.entry_summary) {
-            html += "<div class='section'><h3>Entry Summary</h3><table>";
-            for (const key in data.entry_summary) {
-                html += `<tr><th>${key}</th><td>${data.entry_summary[key] || ""}</td></tr>`;
-            }
-            html += "</table></div>";
-        }
-
-        // ================= Parts Worksheet =================
-        if (data.parts_worksheet) {
-            html += "<div class='section'><h3>Parts Worksheet</h3>";
-
-            html += "<p><strong>Supplier:</strong> " + 
-                    (data.parts_worksheet.Supplier || "") + "</p>";
-
-            if (data.parts_worksheet.LineItems && 
-                Array.isArray(data.parts_worksheet.LineItems) &&
-                data.parts_worksheet.LineItems.length > 0) {
-
-                html += "<table><tr>";
-
-                const headers = Object.keys(data.parts_worksheet.LineItems[0]);
-                headers.forEach(h => html += `<th>${h}</th>`);
-                html += "</tr>";
-
-                data.parts_worksheet.LineItems.forEach(item => {
-                    html += "<tr>";
-                    headers.forEach(h => {
-                        html += `<td>${item[h] || ""}</td>`;
-                    });
-                    html += "</tr>";
-                });
-
-                html += "</table>";
-            }
-
-            html += "</div>";
-        }
-
-        outputDiv.innerHTML = html || "<p>No extracted data found.</p>";
-
-    } catch (err) {
-        outputDiv.innerHTML = 
-            "<p class='error'>Connection error. Check CORS settings.</p>";
-        console.error(err);
-    }
+function apiBase() {
+  // If hosted in Azure Static Web Apps with linked API, "/api" routes to Functions.
+  // If not linked, you can hardcode function URL later.
+  return "/api";
 }
 
+async function uploadFiles() {
+  const el = document.getElementById("fileInput");
+  const statusEl = document.getElementById("uploadStatus");
+  statusEl.className = "muted";
+  statusEl.textContent = "";
+
+  if (!el.files || el.files.length === 0) {
+    statusEl.className = "err";
+    statusEl.textContent = "Please select at least one file.";
+    return;
+  }
+
+  // Build multipart/form-data with field name "files" (matches your backend)
+  const fd = new FormData();
+  for (const f of el.files) fd.append("files", f);
+
+  statusEl.textContent = "Uploading...";
+
+  try {
+    const res = await fetch(`${apiBase()}/upload`, {
+      method: "POST",
+      body: fd
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      statusEl.className = "err";
+      statusEl.textContent = `Upload failed (${res.status}). ${t}`;
+      return;
+    }
+
+    const data = await res.json();
+    const jobId = data.jobId;
+
+    statusEl.className = "ok";
+    statusEl.textContent = `Uploaded. Job ID: ${jobId}`;
+
+    // Auto-fill Job ID for convenience
+    document.getElementById("jobIdInput").value = jobId;
+
+  } catch (e) {
+    statusEl.className = "err";
+    statusEl.textContent = "Connection error while uploading. Check CORS / API link. " + e;
+  }
+}
+
+async function loadJob() {
+  const jobId = document.getElementById("jobIdInput").value.trim();
+  const loadStatus = document.getElementById("loadStatus");
+  loadStatus.className = "muted";
+  loadStatus.textContent = "";
+
+  if (!jobId) {
+    loadStatus.className = "err";
+    loadStatus.textContent = "Enter jobId";
+    return;
+  }
+
+  loadStatus.textContent = "Loading...";
+
+  try {
+    const res = await fetch(`${apiBase()}/job/${jobId}/ui`);
+
+    if (!res.ok) {
+      document.getElementById("output").innerHTML = "<p class='err'>Job not ready or invalid Job ID.</p>";
+      loadStatus.className = "err";
+      loadStatus.textContent = `Not ready (${res.status})`;
+      return;
+    }
+
+    const data = await res.json();
+    loadStatus.className = "ok";
+    loadStatus.textContent = "Loaded.";
+
+    let html = "";
+
+    // CEVA
+    html += "<div class='section'><h3>CEVA</h3><table>";
+    for (const key in (data.ceva || {})) {
+      html += `<tr><th>${key}</th><td>${data.ceva[key] ?? ""}</td></tr>`;
+    }
+    html += "</table></div>";
+
+    // Entry Summary
+    html += "<div class='section'><h3>Entry Summary</h3><table>";
+    for (const key in (data.entry_summary || {})) {
+      html += `<tr><th>${key}</th><td>${data.entry_summary[key] ?? ""}</td></tr>`;
+    }
+    html += "</table></div>";
+
+    // Parts Worksheet
+    html += "<div class='section'><h3>Parts Worksheet</h3>";
+    html += "<p><strong>Supplier:</strong> " + ((data.parts_worksheet || {}).Supplier || "") + "</p>";
+
+    const lineItems = (data.parts_worksheet || {}).LineItems;
+    if (Array.isArray(lineItems) && lineItems.length > 0) {
+      html += "<table><tr>";
+      const headers = Object.keys(lineItems[0] || {});
+      headers.forEach(h => html += `<th>${h}</th>`);
+      html += "</tr>";
+
+      lineItems.forEach(item => {
+        html += "<tr>";
+        headers.forEach(h => html += `<td>${(item && item[h] != null) ? item[h] : ""}</td>`);
+        html += "</tr>";
+      });
+
+      html += "</table>";
+    } else {
+      html += "<p class='muted'>No line items found.</p>";
+    }
+
+    html += "</div>";
+
+    document.getElementById("output").innerHTML = html;
+
+  } catch (e) {
+    document.getElementById("output").innerHTML = "<p class='err'>Connection error. Check CORS settings.</p>";
+    loadStatus.className = "err";
+    loadStatus.textContent = "Connection error.";
+  }
+}
 </script>
 
 </body>
