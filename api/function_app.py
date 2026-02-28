@@ -652,3 +652,74 @@ def job_worker(msg: func.QueueMessage) -> None:
         print(f"[worker][ERROR] {str(e)}")
         write_status("failed", {"error": str(e)})
         return
+# =========================
+# HTTP: Get UI-friendly job output
+# =========================
+@app.route(route="job/{jobId}/ui", methods=["GET"])
+def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
+    job_id = req.route_params.get("jobId")
+
+    try:
+        results_container = os.environ.get("RESULTS_CONTAINER", "results")
+        rc = blob_service().get_container_client(results_container)
+
+        blob_path = f"{job_id}/table.json"
+        blob_client = rc.get_blob_client(blob_path)
+
+        if not blob_client.exists():
+            return func.HttpResponse(
+                json.dumps({"error": "Not ready"}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
+        data = json.loads(blob_client.download_blob().readall())
+
+        # ---- Simplify + remove geometry ----
+        def simplify(value):
+            if isinstance(value, dict):
+
+                # unwrap DI typed fields
+                if "valueString" in value:
+                    return value["valueString"]
+                if "valueNumber" in value:
+                    return value["valueNumber"]
+                if "valueArray" in value:
+                    return [simplify(v.get("valueObject", v)) for v in value["valueArray"]]
+                if "valueObject" in value:
+                    return {k: simplify(v) for k, v in value["valueObject"].items()}
+
+                # remove geometry
+                clean = {}
+                for k, v in value.items():
+                    if k in ["boundingRegions", "polygon", "spans", "content"]:
+                        continue
+                    clean[k] = simplify(v)
+                return clean
+
+            if isinstance(value, list):
+                return [simplify(v) for v in value]
+
+            return value
+
+        ui = {
+            "jobId": data.get("jobId"),
+            "pickedPages": data.get("pickedPages"),
+            "confidence": data.get("confidence"),
+            "ceva": simplify(data.get("ceva")),
+            "entry_summary": simplify(data.get("entry_summary")),
+            "parts_worksheet": simplify(data.get("parts_worksheet")),
+        }
+
+        return func.HttpResponse(
+            json.dumps(ui),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500,
+            mimetype="application/json"
+        )
