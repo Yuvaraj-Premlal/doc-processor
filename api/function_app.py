@@ -116,9 +116,12 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
             filename = getattr(f, "filename", "file.pdf")
             blob_path = f"{job_id}/original/{filename}"
 
-            container.upload_blob(blob_path, f.stream, overwrite=True)
+            f.stream.seek(0)                 # important
+            data = f.stream.read()           # read full file
+            container.upload_blob(blob_path, data, overwrite=True)
             uploaded.append({"file": filename, "blob": blob_path})
-
+    # optional debug:
+            print(f"[upload] {filename} bytes={len(data)}")
             msg = {
                 "jobId": job_id,
                 "pdfBlobPath": blob_path,
