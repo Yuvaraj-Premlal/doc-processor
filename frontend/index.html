@@ -1,1 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Document Bundle Viewer</title>
+    <style>
+        body { font-family: Arial; margin: 40px; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+        th { background: #f4f4f4; }
+        .section { margin-top: 30px; }
+    </style>
+</head>
+<body>
 
+<h2>Document Bundle Viewer</h2>
+
+<input type="text" id="jobIdInput" placeholder="Enter Job ID" style="width:400px;">
+<button onclick="loadJob()">Load</button>
+
+<div id="output"></div>
+
+<script>
+async function loadJob() {
+    const jobId = document.getElementById("jobIdInput").value.trim();
+    if (!jobId) return alert("Enter jobId");
+
+    const res = await fetch(`/api/job/${jobId}/ui`);
+    if (!res.ok) {
+        document.getElementById("output").innerHTML = "<p>Not ready or invalid jobId</p>";
+        return;
+    }
+
+    const data = await res.json();
+
+    let html = "";
+
+    // CEVA
+    html += "<div class='section'><h3>CEVA</h3><table>";
+    for (const key in data.ceva) {
+        html += `<tr><th>${key}</th><td>${data.ceva[key]}</td></tr>`;
+    }
+    html += "</table></div>";
+
+    // Entry Summary
+    html += "<div class='section'><h3>Entry Summary</h3><table>";
+    for (const key in data.entry_summary) {
+        html += `<tr><th>${key}</th><td>${data.entry_summary[key]}</td></tr>`;
+    }
+    html += "</table></div>";
+
+    // Parts Worksheet
+    html += "<div class='section'><h3>Parts Worksheet</h3>";
+    html += "<p><strong>Supplier:</strong> " + (data.parts_worksheet.Supplier || "") + "</p>";
+
+    if (data.parts_worksheet.LineItems && data.parts_worksheet.LineItems.length > 0) {
+        html += "<table><tr>";
+        const headers = Object.keys(data.parts_worksheet.LineItems[0]);
+        headers.forEach(h => html += `<th>${h}</th>`);
+        html += "</tr>";
+
+        data.parts_worksheet.LineItems.forEach(item => {
+            html += "<tr>";
+            headers.forEach(h => html += `<td>${item[h] || ""}</td>`);
+            html += "</tr>";
+        });
+
+        html += "</table>";
+    }
+
+    html += "</div>";
+
+    document.getElementById("output").innerHTML = html;
+}
+</script>
+
+</body>
+</html>
