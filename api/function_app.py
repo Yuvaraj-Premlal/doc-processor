@@ -723,3 +723,44 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+# =========================
+# UI Endpoint
+# Returns clean JSON for frontend
+# =========================
+@app.route(route="job/{jobId}/ui", methods=["GET"])
+def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        job_id = req.route_params.get("jobId")
+        if not job_id:
+            return func.HttpResponse("Missing jobId", status_code=400)
+
+        results_container = os.environ.get("RESULTS_CONTAINER", "results")
+        bsc = blob_service()
+        rc = bsc.get_container_client(results_container)
+
+        table_blob_path = f"{job_id}/table.json"
+
+        blob_client = rc.get_blob_client(table_blob_path)
+
+        if not blob_client.exists():
+            return func.HttpResponse("Not ready", status_code=404)
+
+        table_data = json.loads(
+            blob_client.download_blob().readall()
+        )
+
+        # Only send clean sections (ignore geometry/raw/etc.)
+        clean_output = {
+            "jobId": table_data.get("jobId"),
+            "ceva": table_data.get("ceva", {}),
+            "entry_summary": table_data.get("entry_summary", {}),
+            "parts_worksheet": table_data.get("parts_worksheet", {})
+        }
+
+        return func.HttpResponse(
+            json.dumps(clean_output),
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        return func.HttpResponse(str(e), status_code=500)
