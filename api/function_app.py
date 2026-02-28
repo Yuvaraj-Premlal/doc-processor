@@ -12,7 +12,7 @@ from azure.storage.queue import QueueClient
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 
-# PDF split/extract
+# PDF split/extract/rotate
 from pypdf import PdfReader, PdfWriter
 
 
@@ -24,6 +24,16 @@ TARGET_DOC_TYPES = [
     "ENTRY SUMMARY",
     "PARTS WORKSHEET",
 ]
+
+# Map docType -> extraction model id
+EXTRACTION_MODELS = {
+    "CEVA": "ceva-invoice",
+    "ENTRY SUMMARY": "entry-summary",
+    "PARTS WORKSHEET": "parts-worksheet",
+}
+
+# Rotation fallback settings for PARTS WORKSHEET (picked PDFs can be rotated 90°)
+ROTATION_FALLBACK_DEGREES = -90  # try rotating clockwise 270 to make it upright
 
 
 # =========================
@@ -38,7 +48,6 @@ def blob_service() -> BlobServiceClient:
 
 
 def queue_client() -> QueueClient:
-    # Hardcoded to avoid extra configuration
     conn = os.environ["AzureWebJobsStorage"]
     qname = "jobs"
     qc = QueueClient.from_connection_string(conn, qname)
@@ -127,6 +136,96 @@ def extract_single_page_pdf(bundle_reader: PdfReader, page_number_1_based: int) 
     return buf.getvalue()
 
 
+def rotate_pdf_bytes(pdf_bytes: bytes, degrees: int) -> bytes:
+    """
+    Rotate all pages in a PDF by degrees (must be multiple of 90).
+    degrees: +90, +180, +270, -90, etc.
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+
+    # Normalize degrees to [0, 90, 180, 270]
+    deg = degrees % 360
+    for p in reader.pages:
+        # pypdf supports rotate_clockwise / rotate_counter_clockwise
+        if deg == 90:
+            p.rotate_clockwise(90)
+        elif deg == 180:
+            p.rotate_clockwise(180)
+        elif deg == 270:
+            p.rotate_clockwise(270)
+        writer.add_page(p)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def _field_value_simple(field_obj):
+    """
+    Best-effort conversion of DocumentField-like object into a simple JSON value.
+    Prefer structured value if present, else content.
+    """
+    if field_obj is None:
+        return None
+
+    # DocumentField has 'value' for many types in newer SDKs; fall back to content
+    v = getattr(field_obj, "value", None)
+    if v is not None:
+        # value can be primitive, list, dict, etc.
+        return _jsonable(v)
+
+    content = getattr(field_obj, "content", None)
+    if content is not None:
+        return content
+
+    return _jsonable(field_obj)
+
+
+def simplify_analyze_result(result):
+    """
+    Convert analyze result into a simple dict of extracted fields.
+    Assumes first document is the relevant one.
+    """
+    docs = getattr(result, "documents", None) or []
+    if not docs:
+        return {"fields": {}, "docType": None, "confidence": None, "hasData": False}
+
+    d0 = docs[0]
+    doc_type = getattr(d0, "doc_type", None) or getattr(d0, "docType", None)
+    conf = getattr(d0, "confidence", None)
+    fields = getattr(d0, "fields", None) or {}
+
+    simple_fields = {}
+    for k, f in fields.items():
+        simple_fields[str(k)] = _field_value_simple(f)
+
+    has_data = len(simple_fields) > 0 and any(v not in (None, "", [], {}) for v in simple_fields.values())
+    return {"fields": simple_fields, "docType": doc_type, "confidence": conf, "hasData": has_data}
+
+
+def flatten_for_row(prefix: str, obj, out: dict):
+    """
+    Flatten nested dict/list into a single-level dict suitable for 1-row Excel later.
+    Keys become prefix + '.' + nestedKey (lists become index-based).
+    """
+    if obj is None:
+        return
+    if isinstance(obj, (str, int, float, bool)):
+        out[prefix] = obj
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            flatten_for_row(f"{prefix}.{k}", v, out)
+        return
+    if isinstance(obj, list):
+        for i, v in enumerate(obj):
+            flatten_for_row(f"{prefix}[{i}]", v, out)
+        return
+    # fallback
+    out[prefix] = str(obj)
+
+
 # =========================
 # HTTP Upload Endpoint
 # =========================
@@ -196,6 +295,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
 # Queue Worker:
 #   Bundle -> split pages -> classify each page
 #   -> best page per doc type -> save picked single-page PDFs
+#   -> run extraction per picked pdf -> merge into 1-row table.json
 # =========================
 @app.function_name(name="job_worker")
 @app.queue_trigger(
@@ -320,7 +420,7 @@ def job_worker(msg: func.QueueMessage) -> None:
                 ],
             }
 
-        # 5) Save JSON outputs
+        # 5) Save JSON outputs for classification
         page_scores_blob = f"{job_id}/page_classification.json"
         best_pages_blob = f"{job_id}/best_pages.json"
 
@@ -363,6 +463,7 @@ def job_worker(msg: func.QueueMessage) -> None:
                     {
                         "docType": target,
                         "pickedPage": None,
+                        "confidence": bp.get("bestConfidence"),
                         "blob": None,
                         "note": "No matching page found",
                     }
@@ -370,7 +471,6 @@ def job_worker(msg: func.QueueMessage) -> None:
                 continue
 
             picked_pdf_bytes = extract_single_page_pdf(bundle_reader, page_no)
-
             blob_name = f"{job_id}/picked/{safe_slug(target)}_page_{page_no}.pdf"
             rc.upload_blob(blob_name, picked_pdf_bytes, overwrite=True)
 
@@ -395,9 +495,143 @@ def job_worker(msg: func.QueueMessage) -> None:
         rc.upload_blob(picked_blob, json.dumps(picked_payload), overwrite=True)
         print(f"[worker] Wrote {results_container}/{picked_blob}")
 
-        # 7) Final status for this step
+        # 7) Run extraction models on picked PDFs
+        write_status("extracting_models")
+
+        extracted_outputs = []
+        merged_row = {
+            "jobId": job_id,
+            "sourcePdfBlobPath": pdf_blob_path,
+            "createdAt": utc_now_iso(),
+            "pickedPages": {p["docType"]: p["pickedPage"] for p in picked_outputs if p.get("pickedPage")},
+            "confidence": {p["docType"]: p.get("confidence") for p in picked_outputs if p.get("confidence") is not None},
+        }
+
+        flattened = {}
+        # Add core info into flattened too (nice for 1-row Excel later)
+        flattened["jobId"] = job_id
+        flattened["sourcePdfBlobPath"] = pdf_blob_path
+        for dt, pn in merged_row.get("pickedPages", {}).items():
+            flattened[f"picked.{safe_slug(dt)}.page"] = pn
+        for dt, cf in merged_row.get("confidence", {}).items():
+            flattened[f"picked.{safe_slug(dt)}.confidence"] = cf
+
+        for picked in picked_outputs:
+            doc_type = picked.get("docType")
+            picked_blob_path = picked.get("blob")
+            picked_page = picked.get("pickedPage")
+
+            if not picked_blob_path or not picked_page:
+                extracted_outputs.append(
+                    {
+                        "docType": doc_type,
+                        "modelId": EXTRACTION_MODELS.get(doc_type),
+                        "pickedBlob": picked_blob_path,
+                        "pickedPage": picked_page,
+                        "status": "skipped",
+                        "reason": "no picked page",
+                    }
+                )
+                continue
+
+            model_id = EXTRACTION_MODELS.get(doc_type)
+            if not model_id:
+                extracted_outputs.append(
+                    {
+                        "docType": doc_type,
+                        "modelId": None,
+                        "pickedBlob": picked_blob_path,
+                        "pickedPage": picked_page,
+                        "status": "skipped",
+                        "reason": "no model mapping",
+                    }
+                )
+                continue
+
+            # Download picked PDF bytes from results container
+            picked_pdf_bytes = rc.get_blob_client(picked_blob_path).download_blob().readall()
+
+            def analyze_with_model(pdf_bytes_to_use: bytes):
+                poller = client.begin_analyze_document(
+                    model_id,
+                    body=pdf_bytes_to_use,
+                    content_type="application/pdf",
+                )
+                return poller.result()
+
+            # First attempt
+            analyze_result = analyze_with_model(picked_pdf_bytes)
+            simplified = simplify_analyze_result(analyze_result)
+
+            used_rotation = 0
+
+            # Rotation fallback only for PARTS WORKSHEET if extraction seems empty
+            if normalize_doctype(doc_type) == "PARTS WORKSHEET" and not simplified.get("hasData", False):
+                try:
+                    rotated_bytes = rotate_pdf_bytes(picked_pdf_bytes, ROTATION_FALLBACK_DEGREES)
+                    analyze_result_2 = analyze_with_model(rotated_bytes)
+                    simplified_2 = simplify_analyze_result(analyze_result_2)
+
+                    # Keep the one with more data
+                    if simplified_2.get("hasData", False) and len(simplified_2.get("fields", {})) >= len(simplified.get("fields", {})):
+                        analyze_result = analyze_result_2
+                        simplified = simplified_2
+                        used_rotation = ROTATION_FALLBACK_DEGREES
+                        # also overwrite a rotated copy for your inspection (optional)
+                        rotated_blob = f"{job_id}/picked/{safe_slug(doc_type)}_page_{picked_page}_ROTATED.pdf"
+                        rc.upload_blob(rotated_blob, rotated_bytes, overwrite=True)
+                        print(f"[worker] Rotation fallback used for {doc_type}; wrote {results_container}/{rotated_blob}")
+                except Exception as rot_e:
+                    print(f"[worker][WARN] Rotation fallback failed for {doc_type}: {str(rot_e)}")
+
+            # Save extraction output
+            extracted_blob = f"{job_id}/extracted/{safe_slug(doc_type)}.json"
+            extracted_payload = {
+                "jobId": job_id,
+                "docType": doc_type,
+                "modelId": model_id,
+                "pickedBlob": picked_blob_path,
+                "pickedPage": picked_page,
+                "pickedConfidence": picked.get("confidence"),
+                "createdAt": utc_now_iso(),
+                "rotationAppliedDegrees": used_rotation,
+                "simplified": simplified,
+                "raw": _jsonable(analyze_result),
+            }
+            rc.upload_blob(extracted_blob, json.dumps(extracted_payload), overwrite=True)
+            print(f"[worker] Wrote {results_container}/{extracted_blob}")
+
+            extracted_outputs.append(
+                {
+                    "docType": doc_type,
+                    "modelId": model_id,
+                    "pickedBlob": picked_blob_path,
+                    "pickedPage": picked_page,
+                    "rotationAppliedDegrees": used_rotation,
+                    "extractedBlob": extracted_blob,
+                    "fieldCount": len(simplified.get("fields", {})),
+                }
+            )
+
+            # Merge into 1 row per bundle
+            # Store nested sections AND a flattened version
+            section_key = safe_slug(doc_type).lower()  # ceva, entry_summary, parts_worksheet
+            merged_row[section_key] = simplified.get("fields", {})
+
+            # Flatten with prefix
+            flatten_for_row(section_key, simplified.get("fields", {}), flattened)
+
+        # Save merged table.json (1 row per bundle)
+        merged_row["extracted"] = extracted_outputs
+        merged_row["flattened"] = flattened
+
+        table_blob = f"{job_id}/table.json"
+        rc.upload_blob(table_blob, json.dumps(merged_row), overwrite=True)
+        print(f"[worker] Wrote {results_container}/{table_blob}")
+
+        # Final status
         write_status(
-            "pages_extracted",
+            "extracted_merged",
             {
                 "totalPages": total_pages,
                 "targets": TARGET_DOC_TYPES,
@@ -406,8 +640,11 @@ def job_worker(msg: func.QueueMessage) -> None:
                     "bestPages": f"{results_container}/{best_pages_blob}",
                     "pickedPages": f"{results_container}/{picked_blob}",
                     "pickedPrefix": f"{results_container}/{job_id}/picked/",
+                    "table": f"{results_container}/{table_blob}",
+                    "extractedPrefix": f"{results_container}/{job_id}/extracted/",
                 },
                 "failedPages": len(failures),
+                "extractedDocs": extracted_outputs,
             },
         )
 
