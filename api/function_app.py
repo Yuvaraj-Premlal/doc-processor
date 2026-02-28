@@ -20,7 +20,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 # Your 3 target doc types (must match your classifier's docType strings)
 TARGET_DOC_TYPES = [
-    "CEVA INVOICE",
+    "CEVA",
     "ENTRY SUMMARY",
     "PARTS WORKSHEET",
 ]
