@@ -12,17 +12,23 @@ from azure.storage.queue import QueueClient
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 
-# PDF diagnostics (make sure `pypdf` is in requirements.txt)
-from pypdf import PdfReader
+# PDF split
+from pypdf import PdfReader, PdfWriter
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+# Your 3 target doc types (must match your classifier's docType strings)
+TARGET_DOC_TYPES = [
+    "CEVA INVOICE",
+    "ENTRY SUMMARY",
+    "PARTS WORKSHEET",
+]
 
 
 # =========================
 # Helpers
 # =========================
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -77,19 +83,31 @@ def _jsonable(obj):
     return str(obj)
 
 
-def safe_filename(s: str) -> str:
-    s = (s or "").strip().replace(" ", "_")
-    keep = []
-    for ch in s:
-        if ch.isalnum() or ch in ("_", "-", "."):
-            keep.append(ch)
-    return "".join(keep) or "UNKNOWN"
+def normalize_doctype(s: str | None) -> str:
+    return (s or "").strip().upper()
+
+
+def split_pdf_to_single_page_pdfs(pdf_bytes: bytes) -> list[dict]:
+    """
+    Returns a list of items:
+      { "pageNumber": 1-based, "pdfBytes": <single-page pdf bytes> }
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    out: list[dict] = []
+
+    for i in range(len(reader.pages)):
+        writer = PdfWriter()
+        writer.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        writer.write(buf)
+        out.append({"pageNumber": i + 1, "pdfBytes": buf.getvalue()})
+
+    return out
 
 
 # =========================
 # HTTP Upload Endpoint
 # =========================
-
 @app.route(route="upload", methods=["POST"])
 def upload(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -153,9 +171,8 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # =========================
-# Queue Worker: Classify + write classification.json
+# Queue Worker: split bundle -> classify each page -> choose best page per doc type
 # =========================
-
 @app.function_name(name="job_worker")
 @app.queue_trigger(
     arg_name="msg",
@@ -202,79 +219,136 @@ def job_worker(msg: func.QueueMessage) -> None:
         print(f"[worker] status => {stage}")
 
     try:
-        write_status("classifying")
+        write_status("page_classifying")
 
         if not pdf_blob_path:
             raise ValueError("pdfBlobPath missing in queue payload.")
 
-        # 1) Download PDF bytes
+        # 1) Download bundle PDF
         pdf_bytes = uc.get_blob_client(pdf_blob_path).download_blob().readall()
-        print(f"[worker] Downloaded PDF size: {len(pdf_bytes)} bytes")
+        print(f"[worker] Downloaded bundle bytes={len(pdf_bytes)}")
 
-        # 2) PROOF: page count + page1 text length (native PDF should show text_len > 0)
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages_in_pdf = len(reader.pages)
-        page1_text_len = len(((reader.pages[0].extract_text() or "").strip()) if pages_in_pdf > 0 else "")
-        print(f"[worker] pages_in_pdf={pages_in_pdf} page1_text_len={page1_text_len}")
+        # 2) Split into single-page PDFs
+        pages = split_pdf_to_single_page_pdfs(pdf_bytes)
+        total_pages = len(pages)
+        print(f"[worker] Split into {total_pages} page PDFs")
 
-        # 3) Call Azure Document Intelligence classifier
+        # 3) Classify each page
         classifier_id = "cevadocclassifier"  # <-- your real classifier ID from Studio
         client = di_client()
 
-        # IMPORTANT: pass content_type for consistent PDF handling
-        poller = client.begin_classify_document(
-            classifier_id,
-            body=pdf_bytes,
-            content_type="application/pdf",
-        )
-        result = poller.result()
+        page_results: list[dict] = []
+        failures: list[dict] = []
 
-        # 4) Simplify results (docType/confidence/pages via boundingRegions.pageNumber)
-        simplified_docs = []
-        documents = getattr(result, "documents", None) or []
+        for item in pages:
+            pno = item["pageNumber"]
+            one_page_pdf = item["pdfBytes"]
 
-        for d in documents:
-            doc_type = getattr(d, "doc_type", None) or getattr(d, "docType", None)
-            confidence = getattr(d, "confidence", None)
+            try:
+                poller = client.begin_classify_document(
+                    classifier_id,
+                    body=one_page_pdf,
+                    content_type="application/pdf",
+                )
+                result = poller.result()
 
-            pages = []
-            brs = getattr(d, "bounding_regions", None) or getattr(d, "boundingRegions", None) or []
-            for br in brs:
-                pn = getattr(br, "page_number", None) or getattr(br, "pageNumber", None)
-                if pn is not None:
-                    pages.append(int(pn))
+                # Expecting one document classification for a single page input
+                docs = getattr(result, "documents", None) or []
+                if docs:
+                    d0 = docs[0]
+                    doc_type = getattr(d0, "doc_type", None) or getattr(d0, "docType", None)
+                    conf = getattr(d0, "confidence", None)
+                else:
+                    doc_type = None
+                    conf = None
 
-            pages = sorted(set(pages)) if pages else None
+                page_results.append(
+                    {
+                        "pageNumber": pno,
+                        "predictedDocType": doc_type,
+                        "confidence": conf,
+                    }
+                )
 
-            simplified_docs.append(
-                {
-                    "docType": doc_type,
-                    "confidence": confidence,
-                    "pages": pages,
-                }
-            )
+                print(f"[worker] page={pno} => {doc_type} (conf={conf})")
 
-        # 5) Save classification.json
-        classification_blob = f"{job_id}/classification.json"
-        classification_payload = {
+            except Exception as e:
+                failures.append({"pageNumber": pno, "error": str(e)})
+                page_results.append(
+                    {
+                        "pageNumber": pno,
+                        "predictedDocType": None,
+                        "confidence": None,
+                        "error": str(e),
+                    }
+                )
+                print(f"[worker][WARN] page={pno} classify failed: {str(e)}")
+
+        # 4) Choose best page (max confidence) for each target doc type
+        #    (No ranges; just the single best page per class)
+        best_pages: dict = {}
+        for target in TARGET_DOC_TYPES:
+            target_norm = normalize_doctype(target)
+            candidates = [
+                r for r in page_results
+                if normalize_doctype(r.get("predictedDocType")) == target_norm
+                and isinstance(r.get("confidence"), (int, float))
+            ]
+            candidates.sort(key=lambda x: float(x["confidence"]), reverse=True)
+
+            best = candidates[0] if candidates else None
+            best_pages[target] = {
+                "bestPageNumber": best["pageNumber"] if best else None,
+                "bestConfidence": float(best["confidence"]) if best else None,
+                # helpful for debugging / fallback without “ranges”
+                "topPages": [
+                    {"pageNumber": c["pageNumber"], "confidence": float(c["confidence"])}
+                    for c in candidates[:3]
+                ],
+            }
+
+        # 5) Save outputs
+        page_scores_blob = f"{job_id}/page_classification.json"
+        best_pages_blob = f"{job_id}/best_pages.json"
+
+        page_payload = {
             "jobId": job_id,
             "classifierId": classifier_id,
             "createdAt": utc_now_iso(),
-            "diagnostics": {
+            "bundleDiagnostics": {
                 "downloadedBytes": len(pdf_bytes),
-                "pagesInPdf": pages_in_pdf,
-                "page1TextLen": page1_text_len,
+                "totalPages": total_pages,
+                "failures": failures,
             },
-            "simplified": simplified_docs,
-            "raw": _jsonable(result),
+            "pageResults": page_results,
         }
+        rc.upload_blob(page_scores_blob, json.dumps(page_payload), overwrite=True)
 
-        rc.upload_blob(classification_blob, json.dumps(classification_payload), overwrite=True)
-        print(f"[worker] Wrote {results_container}/{classification_blob}")
+        best_payload = {
+            "jobId": job_id,
+            "classifierId": classifier_id,
+            "createdAt": utc_now_iso(),
+            "targets": TARGET_DOC_TYPES,
+            "bestPages": best_pages,
+        }
+        rc.upload_blob(best_pages_blob, json.dumps(best_payload), overwrite=True)
 
-        write_status("classified", {"documentsFound": len(simplified_docs)})
+        print(f"[worker] Wrote {results_container}/{page_scores_blob}")
+        print(f"[worker] Wrote {results_container}/{best_pages_blob}")
 
-        print(f"[worker] Classification complete for job {job_id}")
+        # 6) Update status
+        write_status(
+            "page_classified",
+            {
+                "totalPages": total_pages,
+                "targets": TARGET_DOC_TYPES,
+                "outputs": {
+                    "pageClassification": f"{results_container}/{page_scores_blob}",
+                    "bestPages": f"{results_container}/{best_pages_blob}",
+                },
+                "failedPages": len(failures),
+            },
+        )
 
     except Exception as e:
         print(f"[worker][ERROR] {str(e)}")
