@@ -27,9 +27,9 @@ TARGET_DOC_TYPES = [
 
 # Map docType -> extraction model id
 EXTRACTION_MODELS = {
-    "CEVA": "ceva-invoice",
-    "ENTRY SUMMARY": "entry-summary",
-    "PARTS WORKSHEET": "parts-worksheet",
+    "CEVA": "ceva_invoice_model",
+    "ENTRY SUMMARY": "entry-summary-v1",
+    "PARTS WORKSHEET": "partsworksheet_model",
 }
 
 # Rotation fallback settings for PARTS WORKSHEET (picked PDFs can be rotated 90°)
