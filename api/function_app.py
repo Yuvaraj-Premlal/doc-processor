@@ -212,12 +212,12 @@ def job_worker(msg: func.QueueMessage) -> None:
         client = di_client()
 
         poller = client.begin_classify_document(
-            classifier_id=classifier_id,
-            classify_request=pdf_bytes
+            classifier_id,
+            body=pdf_bytes
         )
-
         result = poller.result()
-
+        
+      
         # 4️⃣ Simplify results
         simplified_docs = []
         documents = getattr(result, "documents", []) or []
