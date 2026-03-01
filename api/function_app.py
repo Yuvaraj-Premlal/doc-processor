@@ -35,11 +35,9 @@ EXTRACTION_MODELS = {
 
 ROTATION_FALLBACK_DEGREES = -90
 
-# Pagination defaults (UI list)
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 200
 
-# Your exact CEVA invoice date field name:
 CEVA_INVOICE_DATE_FIELD = "INVOICE DATE"
 
 
@@ -50,14 +48,11 @@ CEVA_INVOICE_DATE_FIELD = "INVOICE DATE"
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def utc_now_iso() -> str:
     return utc_now().isoformat()
 
-
 def blob_service() -> BlobServiceClient:
     return BlobServiceClient.from_connection_string(os.environ["AzureWebJobsStorage"])
-
 
 def queue_client() -> QueueClient:
     q = QueueClient.from_connection_string(os.environ["AzureWebJobsStorage"], "jobs")
@@ -67,19 +62,16 @@ def queue_client() -> QueueClient:
         pass
     return q
 
-
 def di_client() -> DocumentIntelligenceClient:
     return DocumentIntelligenceClient(
         endpoint=os.environ["DI_ENDPOINT"],
         credential=AzureKeyCredential(os.environ["DI_KEY"]),
     )
 
-
 def cosmos_container():
     client = CosmosClient(os.environ["COSMOS_ENDPOINT"], credential=os.environ["COSMOS_KEY"])
     db = client.get_database_client(os.environ.get("COSMOS_DATABASE", "pdfbundle"))
     return db.get_container_client(os.environ.get("COSMOS_CONTAINER", "results"))
-
 
 def delete_prefix(container_client, prefix: str):
     for blob in container_client.list_blobs(name_starts_with=prefix):
@@ -93,10 +85,8 @@ def delete_prefix(container_client, prefix: str):
 def normalize_doctype(s: Optional[str]) -> str:
     return (s or "").strip().upper()
 
-
 def safe_slug(s: str) -> str:
     return (s or "").strip().upper().replace(" ", "_")
-
 
 def rotate_pdf_bytes(pdf_bytes: bytes, degrees: int) -> bytes:
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -113,7 +103,6 @@ def rotate_pdf_bytes(pdf_bytes: bytes, degrees: int) -> bytes:
     buf = io.BytesIO()
     writer.write(buf)
     return buf.getvalue()
-
 
 def _jsonable(obj):
     if obj is None:
@@ -135,7 +124,6 @@ def _jsonable(obj):
                 pass
     return str(obj)
 
-
 def _field_value_simple(field):
     if field is None:
         return None
@@ -146,7 +134,6 @@ def _field_value_simple(field):
     if content is not None:
         return content
     return _jsonable(field)
-
 
 def simplify_analyze_result(result):
     docs = getattr(result, "documents", None) or []
@@ -160,6 +147,56 @@ def simplify_analyze_result(result):
 
     has_data = any(v not in (None, "", [], {}) for v in simple.values())
     return {"fields": simple, "hasData": has_data}
+
+
+# =========================
+# DI Wrapper Unwrap (CRITICAL)
+# =========================
+
+def unwrap_di(value: Any) -> Any:
+    """
+    Convert Document Intelligence typed wrappers into plain JSON.
+    Handles:
+      - {"valueString": "..."} -> "..."
+      - {"valueNumber": 1} -> 1
+      - {"type":"array","valueArray":[...]} -> [...]
+      - {"type":"object","valueObject":{...}} -> {...}
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, list):
+        return [unwrap_di(v) for v in value]
+
+    if isinstance(value, dict):
+        # direct
+        for k in ("valueString", "valueNumber", "valueInteger", "valueBoolean"):
+            if k in value:
+                return value[k]
+
+        if "valueArray" in value:
+            return [unwrap_di(v) for v in value["valueArray"]]
+
+        if "valueObject" in value and isinstance(value["valueObject"], dict):
+            return {k: unwrap_di(v) for k, v in value["valueObject"].items()}
+
+        # DI often returns type + valueArray/valueObject
+        if value.get("type") == "array" and "valueArray" in value:
+            return [unwrap_di(v) for v in value["valueArray"]]
+
+        if value.get("type") == "object" and "valueObject" in value and isinstance(value["valueObject"], dict):
+            return {k: unwrap_di(v) for k, v in value["valueObject"].items()}
+
+        # Generic dict: recurse but drop geometry
+        drop = {"boundingRegions", "polygon", "spans", "content", "confidence", "type"}
+        out = {}
+        for k, v in value.items():
+            if k in drop:
+                continue
+            out[k] = unwrap_di(v)
+        return out
+
+    return value
 
 
 def flatten_for_row(prefix, obj, out: dict):
@@ -181,19 +218,13 @@ def _get_query_param(req: func.HttpRequest, name: str, default=None):
     v = req.params.get(name)
     return v if v is not None else default
 
-
 def _parse_int(s, default: int):
     try:
         return int(s)
     except Exception:
         return default
 
-
 def _parse_iso_date_only(s: Optional[str]) -> Optional[str]:
-    """
-    Accept YYYY-MM-DD (preferred) OR ISO datetime.
-    Return date-only string YYYY-MM-DD or None.
-    """
     if not s:
         return None
     s = s.strip()
@@ -203,10 +234,8 @@ def _parse_iso_date_only(s: Optional[str]) -> Optional[str]:
             return d
     return None
 
-
 def _is_pdf_filename(name: str) -> bool:
     return (name or "").lower().endswith(".pdf")
-
 
 def _is_zip_filename(name: str) -> bool:
     return (name or "").lower().endswith(".zip")
@@ -215,46 +244,34 @@ def _is_zip_filename(name: str) -> bool:
 # ---------- Invoice Date parsing (best effort) ----------
 
 def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
-    """
-    Best-effort parsing for invoice date formats.
-    Returns YYYY-MM-DD or None.
-    """
     if value is None:
         return None
-
     s = str(value).strip()
     if not s:
         return None
-
-    # ISO-like: 2026-03-01...
     if len(s) >= 10 and s[4] == "-" and s[7] == "-":
         return s[:10]
 
-    # Normalize separators
     s2 = s.replace(".", "/").replace("-", "/")
     parts = [p.strip() for p in s2.split("/") if p.strip()]
 
-    # YYYY/MM/DD
     if len(parts) == 3 and len(parts[0]) == 4:
         y, m, d = parts[0], parts[1].zfill(2), parts[2].zfill(2)
         if y.isdigit() and m.isdigit() and d.isdigit():
             return f"{y}-{m}-{d}"
 
-    # DD/MM/YYYY or MM/DD/YYYY
     if len(parts) == 3 and len(parts[2]) == 4 and parts[2].isdigit():
         a, b, y = parts[0], parts[1], parts[2]
         if a.isdigit() and b.isdigit():
-            da = int(a)
-            db = int(b)
+            da, db = int(a), int(b)
             if da > 12:
                 d, m = da, db
             elif db > 12:
                 m, d = da, db
             else:
-                d, m = da, db  # default day-first
+                d, m = da, db
             return f"{y}-{str(m).zfill(2)}-{str(d).zfill(2)}"
 
-    # Try "01 Mar 2026" / "01-Mar-2026"
     try:
         t = s.replace("-", " ").replace("/", " ")
         dt = datetime.strptime(t.strip(), "%d %b %Y")
@@ -273,23 +290,14 @@ def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
 
 
 def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
-    """
-    Exact priority:
-      1) doc["ceva"]["INVOICE DATE"] (exact field name)
-      2) doc["ceva"] any key containing invoice+date
-      3) doc["flattened"] keys starting with ceva.*invoice*date*
-    Returns YYYY-MM-DD or None.
-    """
     ceva = doc.get("ceva") if isinstance(doc.get("ceva"), dict) else {}
     flattened = doc.get("flattened") if isinstance(doc.get("flattened"), dict) else {}
 
-    # 1) Exact key
     if CEVA_INVOICE_DATE_FIELD in ceva:
         parsed = _try_parse_date_to_yyyy_mm_dd(ceva.get(CEVA_INVOICE_DATE_FIELD))
         if parsed:
             return parsed
 
-    # 2) Heuristic within ceva
     for k, v in ceva.items():
         lk = str(k).strip().lower()
         if "invoice" in lk and "date" in lk:
@@ -297,7 +305,6 @@ def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
             if parsed:
                 return parsed
 
-    # 3) flattened keys
     for k, v in flattened.items():
         lk = str(k).lower()
         if lk.startswith("ceva.") and "invoice" in lk and "date" in lk:
@@ -311,9 +318,6 @@ def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
 # ---------- Date range helpers ----------
 
 def _compute_range(range_key: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (from_yyyy_mm_dd, to_yyyy_mm_dd) inclusive.
-    """
     if not range_key:
         return (None, None)
 
@@ -369,7 +373,6 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
     def enqueue_one_pdf(pdf_bytes: bytes, filename: str) -> dict:
         job_id = str(uuid.uuid4())
         blob_path = f"{job_id}/original/{filename}"
-
         uploads.upload_blob(blob_path, pdf_bytes, overwrite=True)
         qc.send_message(json.dumps({"jobId": job_id, "pdfBlobPath": blob_path, "fileName": filename}))
         return {"jobId": job_id, "fileName": filename, "blobPath": blob_path, "bytes": len(pdf_bytes)}
@@ -394,7 +397,6 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
 
             elif _is_pdf_filename(filename):
                 jobs.append(enqueue_one_pdf(data, filename))
-
             else:
                 return func.HttpResponse(
                     json.dumps({"error": f"Unsupported file type: {filename}. Upload PDF or ZIP containing PDFs."}),
@@ -409,11 +411,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(json.dumps(resp), status_code=200, mimetype="application/json")
 
     except zipfile.BadZipFile:
-        return func.HttpResponse(
-            json.dumps({"error": "Invalid ZIP file."}),
-            status_code=400,
-            mimetype="application/json",
-        )
+        return func.HttpResponse(json.dumps({"error": "Invalid ZIP file."}), status_code=400, mimetype="application/json")
     except Exception as e:
         return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500, mimetype="application/json")
 
@@ -492,13 +490,12 @@ def job_worker(msg: func.QueueMessage) -> None:
             if matches:
                 best_pages[target] = matches[0]
 
-        merged = {}
-        flattened = {}
-        picked_pages = {}
-        confidence = {}
-        extracted_docs = []
+        merged: Dict[str, Any] = {}
+        flattened: Dict[str, Any] = {}
+        picked_pages: Dict[str, Any] = {}
+        confidence: Dict[str, Any] = {}
+        extracted_docs: List[Dict[str, Any]] = []
 
-        # Extraction
         for doc_type, info in best_pages.items():
             model_id = EXTRACTION_MODELS.get(doc_type)
             if not model_id:
@@ -527,9 +524,12 @@ def job_worker(msg: func.QueueMessage) -> None:
                 except Exception:
                     pass
 
+            # CRITICAL: unwrap DI wrappers BEFORE saving/flattening
+            clean_fields = unwrap_di(simplified.get("fields", {}))
+
             key = safe_slug(doc_type).lower()
-            merged[key] = simplified.get("fields", {})
-            flatten_for_row(key, simplified.get("fields", {}), flattened)
+            merged[key] = clean_fields
+            flatten_for_row(key, clean_fields, flattened)
 
             picked_pages[doc_type] = info.get("pageNumber")
             confidence[doc_type] = info.get("confidence")
@@ -539,7 +539,7 @@ def job_worker(msg: func.QueueMessage) -> None:
                 "modelId": model_id,
                 "page": info.get("pageNumber"),
                 "rotationAppliedDegrees": used_rotation,
-                "fieldCount": len(simplified.get("fields", {})),
+                "fieldCount": len(clean_fields) if isinstance(clean_fields, dict) else 0,
             })
 
         final_doc = {
@@ -563,12 +563,10 @@ def job_worker(msg: func.QueueMessage) -> None:
             **merged,
         }
 
-        # Store top-level queryable invoice date
         final_doc["cevaInvoiceDate"] = _extract_ceva_invoice_date(final_doc)
 
         container.upsert_item(final_doc)
 
-        # Cleanup uploads after success
         delete_prefix(uploads, f"{job_id}/")
 
     except Exception as e:
@@ -608,12 +606,18 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
     if status == "failed":
         return func.HttpResponse(json.dumps({"id": job_id, "status": "failed", "error": doc.get("error"), "failedAt": doc.get("failedAt")}, default=str), status_code=200, mimetype="application/json")
 
+    # Backward compat for old docs that still have wrappers:
+    pw = doc.get("parts_worksheet") if isinstance(doc.get("parts_worksheet"), dict) else {}
+    if isinstance(pw.get("LineItems"), dict):
+        pw["LineItems"] = unwrap_di(pw["LineItems"])
+        doc["parts_worksheet"] = pw
+
     return func.HttpResponse(json.dumps(doc, default=str), status_code=200, mimetype="application/json")
 
 
 # =========================
-# Results Listing with Pagination + Invoice Date Filters
-# GET /api/results?pageSize=20&token=...&range=last_month&invoiceFrom=YYYY-MM-DD&invoiceTo=YYYY-MM-DD
+# Results Listing (pagination + createdRange + invoice filters)
+# GET /api/results?pageSize=20&token=...&createdRange=last_7_days&invoiceFrom=YYYY-MM-DD&invoiceTo=YYYY-MM-DD
 # =========================
 
 @app.route(route="results", methods=["GET"])
@@ -628,14 +632,15 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
     status = _get_query_param(req, "status", None)
     q = _get_query_param(req, "q", None)
 
+    # NEW: createdRange applies to createdAt
+    created_range = _get_query_param(req, "createdRange", "all")
+    created_from, created_to = _compute_range(created_range)
+    # createdAt stored as ISO datetime string; compare with full ISO boundaries
+    created_from_iso = f"{created_from}T00:00:00Z" if created_from else None
+    created_to_iso = f"{created_to}T23:59:59Z" if created_to else None
+
     invoice_from = _parse_iso_date_only(_get_query_param(req, "invoiceFrom", None))
     invoice_to = _parse_iso_date_only(_get_query_param(req, "invoiceTo", None))
-    range_key = _get_query_param(req, "range", None)
-
-    if range_key and range_key.strip().lower() != "all":
-        rf, rt = _compute_range(range_key)
-        if not invoice_from and not invoice_to:
-            invoice_from, invoice_to = rf, rt
 
     where = ['c.type = "bundle_result"']
     params = []
@@ -648,6 +653,14 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
         where.append("CONTAINS(LOWER(c.fileName), LOWER(@q))")
         params.append({"name": "@q", "value": q})
 
+    if created_from_iso:
+        where.append("c.createdAt >= @createdFrom")
+        params.append({"name": "@createdFrom", "value": created_from_iso})
+
+    if created_to_iso:
+        where.append("c.createdAt <= @createdTo")
+        params.append({"name": "@createdTo", "value": created_to_iso})
+
     if invoice_from:
         where.append("IS_DEFINED(c.cevaInvoiceDate) AND c.cevaInvoiceDate >= @invFrom")
         params.append({"name": "@invFrom", "value": invoice_from})
@@ -658,8 +671,9 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
 
     where_clause = " AND ".join(where)
 
+    # IMPORTANT: return flattened so UI can render more columns
     query = f"""
-    SELECT c.id, c.fileName, c.createdAt, c.completedAt, c.status, c.cevaInvoiceDate
+    SELECT c.id, c.fileName, c.createdAt, c.completedAt, c.status, c.cevaInvoiceDate, c.flattened
     FROM c
     WHERE {where_clause}
     ORDER BY c.createdAt DESC
@@ -688,9 +702,8 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # =========================
-# Excel Export for ALL matching jobs (NOT just recent)
-# GET /api/results/excel?range=last_month&invoiceFrom=...&invoiceTo=...
-# Uses CEVA invoice date filter.
+# Excel Export for ALL matching jobs
+# GET /api/results/excel?createdRange=last_30_days&invoiceFrom=...&invoiceTo=...
 # =========================
 
 def _autosize_columns(ws, max_col: int, max_width: int = 60):
@@ -711,14 +724,13 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
     status = _get_query_param(req, "status", None)
     q = _get_query_param(req, "q", None)
 
+    created_range = _get_query_param(req, "createdRange", "all")
+    created_from, created_to = _compute_range(created_range)
+    created_from_iso = f"{created_from}T00:00:00Z" if created_from else None
+    created_to_iso = f"{created_to}T23:59:59Z" if created_to else None
+
     invoice_from = _parse_iso_date_only(_get_query_param(req, "invoiceFrom", None))
     invoice_to = _parse_iso_date_only(_get_query_param(req, "invoiceTo", None))
-    range_key = _get_query_param(req, "range", None)
-
-    if range_key and range_key.strip().lower() != "all":
-        rf, rt = _compute_range(range_key)
-        if not invoice_from and not invoice_to:
-            invoice_from, invoice_to = rf, rt
 
     where = ['c.type = "bundle_result"']
     params = []
@@ -730,6 +742,14 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
     if q:
         where.append("CONTAINS(LOWER(c.fileName), LOWER(@q))")
         params.append({"name": "@q", "value": q})
+
+    if created_from_iso:
+        where.append("c.createdAt >= @createdFrom")
+        params.append({"name": "@createdFrom", "value": created_from_iso})
+
+    if created_to_iso:
+        where.append("c.createdAt <= @createdTo")
+        params.append({"name": "@createdTo", "value": created_to_iso})
 
     if invoice_from:
         where.append("IS_DEFINED(c.cevaInvoiceDate) AND c.cevaInvoiceDate >= @invFrom")
@@ -761,7 +781,7 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         for page in items_iterable.by_page():
             all_docs.extend(list(page))
 
-        # Union of flattened keys
+        # Union flattened keys
         flat_keys_set = set()
         for d in all_docs:
             flat = d.get("flattened")
@@ -771,7 +791,6 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
 
         wb = Workbook()
 
-        # Jobs sheet
         ws_jobs = wb.active
         ws_jobs.title = "Jobs"
 
@@ -795,11 +814,18 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         # LineItems sheet
         ws_li = wb.create_sheet("LineItems")
         item_keys_set = set()
-        all_items = []  # list of (doc, item)
+        all_items = []
 
         for d in all_docs:
             pw = d.get("parts_worksheet") if isinstance(d.get("parts_worksheet"), dict) else {}
-            li = pw.get("LineItems") if isinstance(pw.get("LineItems"), list) else []
+            li = pw.get("LineItems")
+
+            # handle both new (list) and old (wrapped) formats
+            if isinstance(li, dict):
+                li = unwrap_di(li)
+            if not isinstance(li, list):
+                li = []
+
             for item in li:
                 if isinstance(item, dict):
                     item_keys_set.update(item.keys())
@@ -823,11 +849,9 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         wb.save(out)
         out.seek(0)
 
-        suffix = "all"
+        suffix = created_range or "all"
         if invoice_from or invoice_to:
-            suffix = f"{invoice_from or '...'}_to_{invoice_to or '...'}"
-        elif range_key:
-            suffix = range_key
+            suffix = f"{suffix}_{invoice_from or '...'}_to_{invoice_to or '...'}"
 
         filename = f"bundle_export_{suffix}.xlsx"
         headers_resp = {"Content-Disposition": f'attachment; filename="{filename}"'}
