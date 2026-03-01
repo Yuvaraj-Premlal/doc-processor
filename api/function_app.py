@@ -6,7 +6,7 @@ import base64
 import io
 import zipfile
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Any, Dict, List
 
 from azure.storage.blob import BlobServiceClient
 from azure.storage.queue import QueueClient
@@ -35,9 +35,12 @@ EXTRACTION_MODELS = {
 
 ROTATION_FALLBACK_DEGREES = -90
 
-# Pagination defaults
+# Pagination defaults (UI list)
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 200
+
+# Your exact CEVA invoice date field name:
+CEVA_INVOICE_DATE_FIELD = "INVOICE DATE"
 
 
 # =========================
@@ -213,13 +216,7 @@ def _is_zip_filename(name: str) -> bool:
 
 def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
     """
-    Best-effort parsing for typical invoice date formats:
-    - YYYY-MM-DD
-    - YYYY/MM/DD
-    - DD/MM/YYYY
-    - MM/DD/YYYY
-    - DD-MMM-YYYY (01-Mar-2026)
-    - ISO datetime startswith YYYY-MM-DD...
+    Best-effort parsing for invoice date formats.
     Returns YYYY-MM-DD or None.
     """
     if value is None:
@@ -233,10 +230,9 @@ def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
     if len(s) >= 10 and s[4] == "-" and s[7] == "-":
         return s[:10]
 
-    # Replace separators to help
+    # Normalize separators
     s2 = s.replace(".", "/").replace("-", "/")
-    parts = s2.split("/")
-    parts = [p.strip() for p in parts if p.strip()]
+    parts = [p.strip() for p in s2.split("/") if p.strip()]
 
     # YYYY/MM/DD
     if len(parts) == 3 and len(parts[0]) == 4:
@@ -250,20 +246,16 @@ def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
         if a.isdigit() and b.isdigit():
             da = int(a)
             db = int(b)
-            # Heuristic: if first > 12 it's day-first
             if da > 12:
                 d, m = da, db
             elif db > 12:
-                # month-first
                 m, d = da, db
             else:
-                # ambiguous -> assume day-first (common in many countries)
-                d, m = da, db
+                d, m = da, db  # default day-first
             return f"{y}-{str(m).zfill(2)}-{str(d).zfill(2)}"
 
-    # Try DD-MMM-YYYY / DD MMM YYYY (very common)
+    # Try "01 Mar 2026" / "01-Mar-2026"
     try:
-        # Normalize: "01 Mar 2026" / "01-Mar-2026"
         t = s.replace("-", " ").replace("/", " ")
         dt = datetime.strptime(t.strip(), "%d %b %Y")
         return dt.strftime("%Y-%m-%d")
@@ -282,32 +274,36 @@ def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
 
 def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
     """
-    Look inside doc["ceva"] fields and doc["flattened"] keys to find invoice date.
-    Returns YYYY-MM-DD if found.
+    Exact priority:
+      1) doc["ceva"]["INVOICE DATE"] (exact field name)
+      2) doc["ceva"] any key containing invoice+date
+      3) doc["flattened"] keys starting with ceva.*invoice*date*
+    Returns YYYY-MM-DD or None.
     """
     ceva = doc.get("ceva") if isinstance(doc.get("ceva"), dict) else {}
     flattened = doc.get("flattened") if isinstance(doc.get("flattened"), dict) else {}
 
-    # 1) Direct keys in ceva
-    # Try common patterns
-    candidates = []
+    # 1) Exact key
+    if CEVA_INVOICE_DATE_FIELD in ceva:
+        parsed = _try_parse_date_to_yyyy_mm_dd(ceva.get(CEVA_INVOICE_DATE_FIELD))
+        if parsed:
+            return parsed
+
+    # 2) Heuristic within ceva
     for k, v in ceva.items():
         lk = str(k).strip().lower()
         if "invoice" in lk and "date" in lk:
-            candidates.append(v)
-        elif lk in ("invoicedate", "invoice_date", "invoice date", "date"):
-            candidates.append(v)
+            parsed = _try_parse_date_to_yyyy_mm_dd(v)
+            if parsed:
+                return parsed
 
-    # 2) Flattened keys (e.g. "ceva.InvoiceDate" or "ceva.invoice_date")
+    # 3) flattened keys
     for k, v in flattened.items():
         lk = str(k).lower()
         if lk.startswith("ceva.") and "invoice" in lk and "date" in lk:
-            candidates.append(v)
-
-    for c in candidates:
-        parsed = _try_parse_date_to_yyyy_mm_dd(c)
-        if parsed:
-            return parsed
+            parsed = _try_parse_date_to_yyyy_mm_dd(v)
+            if parsed:
+                return parsed
 
     return None
 
@@ -316,8 +312,7 @@ def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
 
 def _compute_range(range_key: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Returns (from_yyyy_mm_dd, to_yyyy_mm_dd) for invoice date filtering.
-    to is inclusive.
+    Returns (from_yyyy_mm_dd, to_yyyy_mm_dd) inclusive.
     """
     if not range_key:
         return (None, None)
@@ -325,32 +320,28 @@ def _compute_range(range_key: Optional[str]) -> Tuple[Optional[str], Optional[st
     rk = range_key.strip().lower()
     today = utc_now().date()
 
-    if rk in ("all",):
+    if rk == "all":
         return (None, None)
 
     if rk in ("last_week", "last_7_days"):
         start = today - timedelta(days=7)
         return (start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"))
 
-    if rk in ("last_30_days",):
+    if rk == "last_30_days":
         start = today - timedelta(days=30)
         return (start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"))
 
-    if rk in ("last_month",):
-        # previous calendar month
+    if rk == "last_month":
         first_this_month = today.replace(day=1)
         last_prev_month = first_this_month - timedelta(days=1)
         first_prev_month = last_prev_month.replace(day=1)
         return (first_prev_month.strftime("%Y-%m-%d"), last_prev_month.strftime("%Y-%m-%d"))
 
-    # Unknown -> no range
     return (None, None)
 
 
 # =========================
 # Upload Endpoint (PDF(s) + ZIP)
-# - PDF upload: 1 file -> 1 jobId
-# - ZIP upload: each PDF in zip -> 1 jobId (batchId returned)
 # =========================
 
 @app.route(route="upload", methods=["POST"])
@@ -380,10 +371,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         blob_path = f"{job_id}/original/{filename}"
 
         uploads.upload_blob(blob_path, pdf_bytes, overwrite=True)
-
-        msg = {"jobId": job_id, "pdfBlobPath": blob_path, "fileName": filename}
-        qc.send_message(json.dumps(msg))
-
+        qc.send_message(json.dumps({"jobId": job_id, "pdfBlobPath": blob_path, "fileName": filename}))
         return {"jobId": job_id, "fileName": filename, "blobPath": blob_path, "bytes": len(pdf_bytes)}
 
     try:
@@ -397,11 +385,11 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
                     for zi in z.infolist():
                         if zi.is_dir():
                             continue
-                        inner_name = zi.filename
-                        if not _is_pdf_filename(inner_name):
+                        inner = zi.filename
+                        if not _is_pdf_filename(inner):
                             continue
                         pdf_bytes = z.read(zi)
-                        leaf = inner_name.split("/")[-1].split("\\")[-1] or "file.pdf"
+                        leaf = inner.split("/")[-1].split("\\")[-1] or "file.pdf"
                         jobs.append(enqueue_one_pdf(pdf_bytes, leaf))
 
             elif _is_pdf_filename(filename):
@@ -427,15 +415,11 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
     except Exception as e:
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500,
-            mimetype="application/json",
-        )
+        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500, mimetype="application/json")
 
 
 # =========================
-# Queue Worker (robust, in-memory)
+# Queue Worker
 # =========================
 
 @app.function_name(name="job_worker")
@@ -452,7 +436,6 @@ def job_worker(msg: func.QueueMessage) -> None:
     created_at = utc_now_iso()
 
     try:
-        # Mark processing early (UI can poll)
         container.upsert_item({
             "id": job_id,
             "type": "bundle_result",
@@ -473,18 +456,18 @@ def job_worker(msg: func.QueueMessage) -> None:
         page_results = []
         failures = []
 
-        # -------- CLASSIFICATION --------
+        # Classification per page
         for i, page in enumerate(reader.pages):
             writer = PdfWriter()
             writer.add_page(page)
             buf = io.BytesIO()
             writer.write(buf)
-            single_pdf = buf.getvalue()
+            one_page_pdf = buf.getvalue()
 
             try:
                 poller = client.begin_classify_document(
                     "cevadocclassifier",
-                    body=single_pdf,
+                    body=one_page_pdf,
                     content_type="application/pdf",
                 )
                 result = poller.result()
@@ -493,16 +476,11 @@ def job_worker(msg: func.QueueMessage) -> None:
                     d0 = docs[0]
                     doc_type = getattr(d0, "doc_type", None) or getattr(d0, "docType", None)
                     conf = getattr(d0, "confidence", None)
-                    page_results.append({
-                        "pageNumber": i + 1,
-                        "docType": doc_type,
-                        "confidence": conf,
-                        "pdf": single_pdf,
-                    })
+                    page_results.append({"pageNumber": i + 1, "docType": doc_type, "confidence": conf, "pdf": one_page_pdf})
             except Exception as e:
                 failures.append({"pageNumber": i + 1, "error": str(e)})
 
-        # -------- BEST PAGE SELECTION --------
+        # Pick best page per target
         best_pages = {}
         for target in TARGET_DOC_TYPES:
             matches = [
@@ -520,7 +498,7 @@ def job_worker(msg: func.QueueMessage) -> None:
         confidence = {}
         extracted_docs = []
 
-        # -------- EXTRACTION --------
+        # Extraction
         for doc_type, info in best_pages.items():
             model_id = EXTRACTION_MODELS.get(doc_type)
             if not model_id:
@@ -538,7 +516,6 @@ def job_worker(msg: func.QueueMessage) -> None:
             simplified = simplify_analyze_result(analyze_result)
             used_rotation = 0
 
-            # Rotation fallback for PARTS WORKSHEET
             if normalize_doctype(doc_type) == "PARTS WORKSHEET" and not simplified.get("hasData", False):
                 try:
                     rotated = rotate_pdf_bytes(info["pdf"], ROTATION_FALLBACK_DEGREES)
@@ -586,13 +563,12 @@ def job_worker(msg: func.QueueMessage) -> None:
             **merged,
         }
 
-        # Extract CEVA invoice date and store top-level field for fast filtering
-        invoice_date = _extract_ceva_invoice_date(final_doc)  # YYYY-MM-DD
-        final_doc["cevaInvoiceDate"] = invoice_date  # queryable date-only string
+        # Store top-level queryable invoice date
+        final_doc["cevaInvoiceDate"] = _extract_ceva_invoice_date(final_doc)
 
         container.upsert_item(final_doc)
 
-        # CLEANUP uploads after Cosmos write success
+        # Cleanup uploads after success
         delete_prefix(uploads, f"{job_id}/")
 
     except Exception as e:
@@ -610,65 +586,34 @@ def job_worker(msg: func.QueueMessage) -> None:
 
 
 # =========================
-# UI Endpoint (Cosmos)
+# UI Endpoint
 # =========================
 
 @app.route(route="job/{jobId}/ui", methods=["GET"])
 def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
     job_id = req.route_params.get("jobId")
     if not job_id:
-        return func.HttpResponse(
-            json.dumps({"error": "Missing jobId"}),
-            status_code=400,
-            mimetype="application/json",
-        )
+        return func.HttpResponse(json.dumps({"error": "Missing jobId"}), status_code=400, mimetype="application/json")
 
     container = cosmos_container()
-
     try:
         doc = container.read_item(item=job_id, partition_key=job_id)
     except CosmosResourceNotFoundError:
-        return func.HttpResponse(
-            json.dumps({"id": job_id, "status": "not_found"}),
-            status_code=404,
-            mimetype="application/json",
-        )
+        return func.HttpResponse(json.dumps({"id": job_id, "status": "not_found"}), status_code=404, mimetype="application/json")
 
     status = doc.get("status")
     if status == "processing":
-        return func.HttpResponse(
-            json.dumps({"id": job_id, "status": "processing", "createdAt": doc.get("createdAt")}),
-            status_code=200,
-            mimetype="application/json",
-        )
+        return func.HttpResponse(json.dumps({"id": job_id, "status": "processing", "createdAt": doc.get("createdAt")}), status_code=200, mimetype="application/json")
 
     if status == "failed":
-        return func.HttpResponse(
-            json.dumps({
-                "id": job_id,
-                "status": "failed",
-                "error": doc.get("error"),
-                "failedAt": doc.get("failedAt"),
-            }, default=str),
-            status_code=200,
-            mimetype="application/json",
-        )
+        return func.HttpResponse(json.dumps({"id": job_id, "status": "failed", "error": doc.get("error"), "failedAt": doc.get("failedAt")}, default=str), status_code=200, mimetype="application/json")
 
-    return func.HttpResponse(
-        json.dumps(doc, default=str),
-        status_code=200,
-        mimetype="application/json",
-    )
+    return func.HttpResponse(json.dumps(doc, default=str), status_code=200, mimetype="application/json")
 
 
 # =========================
-# Results Listing (Cosmos) with Pagination
-# Filters are based on CEVA invoice date:
-# - invoiceFrom=YYYY-MM-DD
-# - invoiceTo=YYYY-MM-DD
-# - range=last_week | last_month | last_7_days | last_30_days | all
-#
-# GET /api/results?pageSize=20&token=...&status=completed&q=abc&invoiceFrom=...&invoiceTo=...&range=...
+# Results Listing with Pagination + Invoice Date Filters
+# GET /api/results?pageSize=20&token=...&range=last_month&invoiceFrom=YYYY-MM-DD&invoiceTo=YYYY-MM-DD
 # =========================
 
 @app.route(route="results", methods=["GET"])
@@ -683,14 +628,12 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
     status = _get_query_param(req, "status", None)
     q = _get_query_param(req, "q", None)
 
-    # invoice date filters
     invoice_from = _parse_iso_date_only(_get_query_param(req, "invoiceFrom", None))
     invoice_to = _parse_iso_date_only(_get_query_param(req, "invoiceTo", None))
     range_key = _get_query_param(req, "range", None)
 
     if range_key and range_key.strip().lower() != "all":
         rf, rt = _compute_range(range_key)
-        # only apply quick range if user didn't manually choose dates
         if not invoice_from and not invoice_to:
             invoice_from, invoice_to = rf, rt
 
@@ -705,7 +648,6 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
         where.append("CONTAINS(LOWER(c.fileName), LOWER(@q))")
         params.append({"name": "@q", "value": q})
 
-    # Filter on top-level cevaInvoiceDate (YYYY-MM-DD)
     if invoice_from:
         where.append("IS_DEFINED(c.cevaInvoiceDate) AND c.cevaInvoiceDate >= @invFrom")
         params.append({"name": "@invFrom", "value": invoice_from})
@@ -742,20 +684,13 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            mimetype="application/json",
-            status_code=500,
-        )
+        return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
 
 
 # =========================
 # Excel Export for ALL matching jobs (NOT just recent)
-# GET /api/results/excel?status=completed&q=abc&invoiceFrom=YYYY-MM-DD&invoiceTo=YYYY-MM-DD&range=last_month
-#
-# Produces:
-# - Jobs sheet: one row per job (plus flattened columns)
-# - LineItems sheet: one row per line item across all jobs (jobId + invoiceDate + item columns)
+# GET /api/results/excel?range=last_month&invoiceFrom=...&invoiceTo=...
+# Uses CEVA invoice date filter.
 # =========================
 
 def _autosize_columns(ws, max_col: int, max_width: int = 60):
@@ -806,7 +741,6 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
 
     where_clause = " AND ".join(where)
 
-    # Pull fields needed for export (full doc pieces for flattened + parts worksheet line items)
     query = f"""
     SELECT c.id, c.fileName, c.createdAt, c.completedAt, c.status, c.cevaInvoiceDate,
            c.flattened, c.parts_worksheet
@@ -816,7 +750,6 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
     """
 
     try:
-        # Iterate all pages using continuation tokens
         items_iterable = container.query_items(
             query=query,
             parameters=params,
@@ -828,7 +761,7 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         for page in items_iterable.by_page():
             all_docs.extend(list(page))
 
-        # Build union of flattened keys (across all docs)
+        # Union of flattened keys
         flat_keys_set = set()
         for d in all_docs:
             flat = d.get("flattened")
@@ -838,7 +771,7 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
 
         wb = Workbook()
 
-        # Sheet: Jobs
+        # Jobs sheet
         ws_jobs = wb.active
         ws_jobs.title = "Jobs"
 
@@ -848,23 +781,21 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
 
         for d in all_docs:
             flat = d.get("flattened") if isinstance(d.get("flattened"), dict) else {}
-            row = [
+            ws_jobs.append([
                 d.get("id"),
                 d.get("fileName"),
                 d.get("status"),
                 d.get("createdAt"),
                 d.get("completedAt"),
                 d.get("cevaInvoiceDate"),
-            ] + [flat.get(k) for k in flat_keys]
-            ws_jobs.append(row)
+            ] + [flat.get(k) for k in flat_keys])
 
         _autosize_columns(ws_jobs, len(headers))
 
-        # Sheet: LineItems
+        # LineItems sheet
         ws_li = wb.create_sheet("LineItems")
-        # union of item keys
         item_keys_set = set()
-        all_items = []  # list of (jobMeta, itemDict)
+        all_items = []  # list of (doc, item)
 
         for d in all_docs:
             pw = d.get("parts_worksheet") if isinstance(d.get("parts_worksheet"), dict) else {}
@@ -888,12 +819,10 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         else:
             ws_li.append(["(no line items found)"])
 
-        # Output workbook
         out = io.BytesIO()
         wb.save(out)
         out.seek(0)
 
-        # Filename reflects filter
         suffix = "all"
         if invoice_from or invoice_to:
             suffix = f"{invoice_from or '...'}_to_{invoice_to or '...'}"
@@ -911,8 +840,4 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            mimetype="application/json",
-            status_code=500,
-        )
+        return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
