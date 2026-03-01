@@ -5,3 +5,4 @@ azure-ai-documentintelligence
 azure-core
 pypdf
 azure-cosmos>=4.7.0
+openpyxl>=3.1.2
