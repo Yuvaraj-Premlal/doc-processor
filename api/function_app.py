@@ -276,7 +276,10 @@ def _unwrap_line_item_field(fv: Any) -> Any:
             return str(fv["content"])
 
         # Plain dict with no DI keys — recursively clean values
-        return {k: _unwrap_line_item_field(v) for k, v in fv.items()}
+        # return {k: _unwrap_line_item_field(v) for k, v in fv.items()}
+    # Plain dict with no extractable DI value — return None rather than
+        # leaking metadata dict (type/confidence only, no actual text)
+        return None
 
     # Absolute last resort — ensures JS never sees a raw object
     return str(fv)
