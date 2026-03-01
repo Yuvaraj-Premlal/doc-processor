@@ -109,7 +109,6 @@ def rotate_pdf_bytes(pdf_bytes: bytes, degrees: int) -> bytes:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     writer = PdfWriter()
     deg = degrees % 360
-
     for p in reader.pages:
         if deg == 90:
             p.rotate_clockwise(90)
@@ -118,7 +117,6 @@ def rotate_pdf_bytes(pdf_bytes: bytes, degrees: int) -> bytes:
         elif deg == 270:
             p.rotate_clockwise(270)
         writer.add_page(p)
-
     buf = io.BytesIO()
     writer.write(buf)
     return buf.getvalue()
@@ -130,9 +128,6 @@ def _parse_int(s: Optional[str], default: int) -> int:
         return default
 
 def _parse_iso_date_only(s: Optional[str]) -> Optional[str]:
-    """
-    Accept YYYY-MM-DD (preferred) OR ISO datetime; return YYYY-MM-DD or None.
-    """
     if not s:
         return None
     s = s.strip()
@@ -143,8 +138,6 @@ def _parse_iso_date_only(s: Optional[str]) -> Optional[str]:
 
 # -------------------------
 # DI VALUE NORMALIZATION
-# Converts DI wrapper objects into plain dict/list/string/number
-# so HTML and Excel won't show [object Object] or crash.
 # -------------------------
 def _jsonable(obj):
     if obj is None:
@@ -157,7 +150,6 @@ def _jsonable(obj):
         return [_jsonable(x) for x in obj]
     if isinstance(obj, dict):
         return {k: _jsonable(v) for k, v in obj.items()}
-
     for attr in ("to_dict", "as_dict", "model_dump"):
         fn = getattr(obj, attr, None)
         if callable(fn):
@@ -165,20 +157,13 @@ def _jsonable(obj):
                 return _jsonable(fn())
             except Exception:
                 pass
-
     d = getattr(obj, "__dict__", None)
     if isinstance(d, dict) and d:
         # FIX: was `for v in d.items()` (bug — iterated tuples, ignored keys)
         return {k: _jsonable(v) for k, v in d.items()}
-
     return str(obj)
 
 def _normalize_di_wrapped_value(v: Any) -> Any:
-    """
-    Handles DI "typed" wrappers like:
-      { type, valueString, valueNumber, valueArray, valueObject, content, confidence, ... }
-    and produces plain Python structures.
-    """
     if v is None:
         return None
     if isinstance(v, (str, int, float, bool)):
@@ -186,7 +171,6 @@ def _normalize_di_wrapped_value(v: Any) -> Any:
     if isinstance(v, list):
         return [_normalize_di_wrapped_value(x) for x in v]
     if isinstance(v, dict):
-        # Common DI wrapper keys — extract the plain value directly
         if "valueString" in v:
             return v.get("valueString")
         if "valueNumber" in v:
@@ -203,151 +187,176 @@ def _normalize_di_wrapped_value(v: Any) -> Any:
             return v.get("valuePhoneNumber")
         if "valueSelectionMark" in v:
             return v.get("valueSelectionMark")
-
-        # valueObject => dict of wrapped fields
         if "valueObject" in v and isinstance(v["valueObject"], dict):
             return {k: _normalize_di_wrapped_value(val) for k, val in v["valueObject"].items()}
-
-        # valueArray => list of wrapped items
         if "valueArray" in v and isinstance(v["valueArray"], list):
-            out = []
-            for item in v["valueArray"]:
-                out.append(_normalize_di_wrapped_value(item))
-            return out
-
-        # Plain dict — normalize children, drop noisy geometry keys
+            return [_normalize_di_wrapped_value(item) for item in v["valueArray"]]
         drop = {"boundingRegions", "polygon", "spans"}
         clean = {}
         for k, val in v.items():
-            if k in drop:
-                continue
-            if k == "content":
+            if k in drop or k == "content":
                 continue
             clean[k] = _normalize_di_wrapped_value(val)
         return clean
-
     return _normalize_di_wrapped_value(_jsonable(v))
 
 def _field_value_simple(field):
-    """
-    Converts DocumentField-like object into a simple JSON value,
-    then normalizes wrappers into plain values.
-    """
     if field is None:
         return None
-
     value = getattr(field, "value", None)
     if value is not None:
         return _normalize_di_wrapped_value(_jsonable(value))
-
     content = getattr(field, "content", None)
     if content is not None:
         return content
-
     return _normalize_di_wrapped_value(_jsonable(field))
 
 def simplify_analyze_result(result):
     docs = getattr(result, "documents", None) or []
     if not docs:
         return {"fields": {}, "hasData": False}
-
     fields = getattr(docs[0], "fields", None) or {}
     simple = {}
     for k, v in fields.items():
         simple[str(k)] = _field_value_simple(v)
-
     has_data = any(v not in (None, "", [], {}) for v in simple.values())
     return {"fields": simple, "hasData": has_data}
 
 
 # -------------------------
-# FIX: POST-PROCESS PARTS WORKSHEET
-# Ensures LineItems is always stored as a clean plain list of dicts,
-# regardless of whether the DI SDK returned a wrapped or unwrapped structure.
-# This runs AFTER simplify_analyze_result so it catches any residual wrappers.
+# PARTS WORKSHEET LINE ITEMS — NORMALIZATION
+#
+# _unwrap_line_item_field handles ALL DI field value forms:
+#   1. Standard typed:   {"type":"string","valueString":"SEQ 1",...}  => "SEQ 1"
+#   2. Content-only:     {"type":"string","content":"SEQ 1"}          => "SEQ 1"
+#      (DI omits valueString on low-confidence / rotated page fields)
+#   3. Nested objects / arrays
+#   4. Already plain str/int/float
+#   5. Absolute fallback: str(v) — prevents [object Object] in JS
+#
+# _fix_parts_worksheet_line_items handles LineItems in all storage forms:
+#   Case A — Clean list (new uploads after fix)
+#   Case B — DI wrapper: {"type":"array","valueArray":[{"type":"object","valueObject":{...}}]}
+#   Case C — Missing / None
+#
+# _dedup_spacejoined handles fields where DI concatenates repeated OCR spans:
+#   "4965482 4965482"            => "4965482"
+#   "COOLER CORE COOLER CORE"   => "COOLER CORE"
+#   "4965482 4965483"           => "4965482, 4965483"  (distinct => join with ", ")
 # -------------------------
+
 def _unwrap_line_item_field(fv: Any) -> Any:
-    """
-    Unwrap a single field value that may still be a DI wrapper dict.
-    e.g. {"type":"string","valueString":"SEQ 1",...} => "SEQ 1"
-    """
+    """Fully unwrap a single DI field value to a plain scalar or structure."""
     if fv is None:
         return None
     if isinstance(fv, (str, int, float, bool)):
         return fv
+    if isinstance(fv, list):
+        return [_unwrap_line_item_field(i) for i in fv]
     if isinstance(fv, dict):
-        # Try all known scalar value keys
+        # Typed scalar wrappers — priority order
         for key in ("valueString", "valueNumber", "valueInteger", "valueDate",
                     "valueTime", "valueBoolean", "valuePhoneNumber", "valueSelectionMark"):
             if key in fv:
-                return fv[key]
-        # Nested object — recurse
+                val = fv[key]
+                return _unwrap_line_item_field(val) if isinstance(val, dict) else val
+
+        # Nested object wrapper
         if "valueObject" in fv and isinstance(fv["valueObject"], dict):
             return {k: _unwrap_line_item_field(v) for k, v in fv["valueObject"].items()}
+
+        # Array wrapper
         if "valueArray" in fv and isinstance(fv["valueArray"], list):
             return [_unwrap_line_item_field(i) for i in fv["valueArray"]]
-        # Fall back to content string
+
+        # CRITICAL: content-only fallback — DI sometimes returns a field with
+        # `content` but NO valueString (low-confidence / rotated pages).
+        # Without this branch, the whole dict leaks through and JS shows [object Object].
         if "content" in fv:
-            return fv["content"]
-    return fv
+            return str(fv["content"])
+
+        # Plain dict with no DI keys — recursively clean values
+        return {k: _unwrap_line_item_field(v) for k, v in fv.items()}
+
+    # Absolute last resort — ensures JS never sees a raw object
+    return str(fv)
+
+
+def _dedup_spacejoined(s: str) -> str:
+    """
+    DI sometimes returns a single string where the same value appears twice,
+    space-joined, when it spans multiple OCR regions on the page.
+    e.g. "4965482 4965482" => "4965482"
+         "COOLER CORE COOLER CORE" => "COOLER CORE"
+         "4965482 4965483" => "4965482, 4965483"  (distinct values joined)
+
+    Strategy: only deduplicate when we can confirm EXACT repetition (half-split).
+    Does not mangle legitimate multi-word strings like "FUEL COMPONENT OF DIESEL ENGINE".
+    """
+    s = s.strip()
+    if not s:
+        return s
+
+    tokens = s.split(" ")
+    n = len(tokens)
+
+    # All tokens identical (e.g. "SEQ SEQ")
+    unique = list(dict.fromkeys(tokens))
+    if len(unique) == 1:
+        return unique[0]
+
+    # Even-length exact half-repetition (e.g. "COOLER CORE COOLER CORE")
+    if n >= 2 and n % 2 == 0:
+        half = n // 2
+        first_half = " ".join(tokens[:half])
+        second_half = " ".join(tokens[half:])
+        if first_half == second_half:
+            return first_half
+
+    return s
+
 
 def _fix_parts_worksheet_line_items(pw_fields: dict) -> dict:
     """
-    Takes the parts_worksheet fields dict and ensures LineItems is a clean
-    list of plain dicts. Handles three cases:
-
-      Case 1 — Already a clean list (new behavior after _normalize fix):
-        LineItems = [{"Invoice_Seq": "SEQ 1", ...}]  →  keep as-is
-
-      Case 2 — Still a DI wrapper dict (old/residual behavior):
-        LineItems = {"type":"array","valueArray":[{"type":"object","valueObject":{...}}]}
-        →  unwrap into clean list
-
-      Case 3 — Missing or None:
-        →  set to []
+    Ensures parts_worksheet.LineItems is a clean plain list of dicts.
+    Handles all storage cases (new clean list, old DI wrapper, missing).
+    Also applies _dedup_spacejoined to all string field values.
     """
     if not isinstance(pw_fields, dict):
         return pw_fields
 
     line_items = pw_fields.get("LineItems")
+    raw_items: List[Any] = []
 
-    # Case 1: already a clean list
     if isinstance(line_items, list):
-        # Defensively unwrap each item in case fields inside are still wrapped
-        clean = []
-        for item in line_items:
-            if isinstance(item, dict):
-                clean.append({k: _unwrap_line_item_field(v) for k, v in item.items()})
-            else:
-                clean.append(item)
-        pw_fields["LineItems"] = clean
-        return pw_fields
-
-    # Case 2: DI wrapper dict
-    if isinstance(line_items, dict) and "valueArray" in line_items:
-        raw_array = line_items["valueArray"]
-        if not isinstance(raw_array, list):
-            pw_fields["LineItems"] = []
-            return pw_fields
-
-        clean = []
-        for item in raw_array:
+        # Case A: already a list — may still need field-level unwrapping
+        raw_items = line_items
+    elif isinstance(line_items, dict) and "valueArray" in line_items:
+        # Case B: top-level DI array wrapper
+        for item in (line_items.get("valueArray") or []):
             if not isinstance(item, dict):
                 continue
-            # Each item is {"type":"object","valueObject":{field_name: {type,valueString,...}}}
             vo = item.get("valueObject", {})
-            if not isinstance(vo, dict):
-                continue
-            row = {}
-            for field_name, field_val in vo.items():
-                row[field_name] = _unwrap_line_item_field(field_val)
-            clean.append(row)
-
-        pw_fields["LineItems"] = clean
+            raw_items.append(vo if isinstance(vo, dict) else item)
+    else:
+        # Case C: missing / None / unexpected
+        pw_fields["LineItems"] = []
         return pw_fields
 
-    # Case 3: missing/None/unexpected
-    pw_fields["LineItems"] = []
+    clean_items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        row = {}
+        for field_name, field_val in item.items():
+            unwrapped = _unwrap_line_item_field(field_val)
+            # Deduplicate space-joined repeated values from DI multi-span extraction
+            if isinstance(unwrapped, str):
+                unwrapped = _dedup_spacejoined(unwrapped)
+            row[field_name] = unwrapped
+        clean_items.append(row)
+
+    pw_fields["LineItems"] = clean_items
     return pw_fields
 
 
@@ -375,21 +384,14 @@ def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
     s = str(value).strip()
     if not s:
         return None
-
-    # ISO-like
     if len(s) >= 10 and s[4] == "-" and s[7] == "-":
         return s[:10]
-
     s2 = s.replace(".", "/").replace("-", "/")
     parts = [p.strip() for p in s2.split("/") if p.strip()]
-
-    # YYYY/MM/DD
     if len(parts) == 3 and len(parts[0]) == 4 and parts[0].isdigit():
         y, m, d = parts[0], parts[1].zfill(2), parts[2].zfill(2)
         if m.isdigit() and d.isdigit():
             return f"{y}-{m}-{d}"
-
-    # DD/MM/YYYY or MM/DD/YYYY
     if len(parts) == 3 and len(parts[2]) == 4 and parts[2].isdigit():
         a, b, y = parts[0], parts[1], parts[2]
         if a.isdigit() and b.isdigit():
@@ -399,53 +401,41 @@ def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
             elif db > 12:
                 m, d = da, db
             else:
-                d, m = da, db  # default day-first
+                d, m = da, db
             return f"{y}-{str(m).zfill(2)}-{str(d).zfill(2)}"
-
-    # 01 Mar 2026
     try:
         t = s.replace("-", " ").replace("/", " ")
         dt = datetime.strptime(t.strip(), "%d %b %Y")
         return dt.strftime("%Y-%m-%d")
     except Exception:
         pass
-
-    # 01 March 2026
     try:
         t = s.replace("-", " ").replace("/", " ")
         dt = datetime.strptime(t.strip(), "%d %B %Y")
         return dt.strftime("%Y-%m-%d")
     except Exception:
         pass
-
     return None
 
 def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
     ceva = doc.get("ceva") if isinstance(doc.get("ceva"), dict) else {}
-
     if CEVA_INVOICE_DATE_FIELD in ceva:
         parsed = _try_parse_date_to_yyyy_mm_dd(ceva.get(CEVA_INVOICE_DATE_FIELD))
         if parsed:
             return parsed
-
     for k, v in ceva.items():
         lk = str(k).strip().lower()
         if "invoice" in lk and "date" in lk:
             parsed = _try_parse_date_to_yyyy_mm_dd(v)
             if parsed:
                 return parsed
-
     return None
 
 def _compute_range(range_key: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Invoice date range (inclusive) for filters.
-    """
     if not range_key:
         return (None, None)
     rk = range_key.strip().lower()
     today = utc_now().date()
-
     if rk == "all":
         return (None, None)
     if rk in ("last_week", "last_7_days"):
@@ -459,37 +449,32 @@ def _compute_range(range_key: Optional[str]) -> Tuple[Optional[str], Optional[st
         last_prev_month = first_this_month - timedelta(days=1)
         first_prev_month = last_prev_month.replace(day=1)
         return (first_prev_month.strftime("%Y-%m-%d"), last_prev_month.strftime("%Y-%m-%d"))
-
     return (None, None)
 
 
 # -------------------------
-# SUMMARY COLUMN BUILDING (list page + excel)
+# SUMMARY COLUMNS
 # -------------------------
 SUMMARY_COLS = [
-    ("fileName", "File Name"),
-    ("cevaInvoiceDate", "CEVA INVOICE DATE"),
-    ("invoiceNumber", "INVOICE NUMBER"),
-    ("entryNumber", "ENTRY NUMBER"),
-    ("departureDate", "DEPARTURE DATE"),
-    ("arrivalDate", "ARRIVAL DATE"),
-    ("descriptionOfGoods", "DESCRIPTION OF GOODS"),
-    ("totalEnteredValue", "TOTAL ENTERED VALUE"),
-    ("totalOtherFees", "TOTAL OTHER FEES"),
-    ("duty", "DUTY"),
-    ("supplier", "SUPPLIER"),
-    # first line item (preview)
-    ("parts_Invoice_Seq", "PARTS Invoice_Seq"),
-    ("parts_Invoice_Number", "PARTS Invoice_Number"),
-    ("parts_Part_No", "PARTS Part_No"),
-    ("parts_HTS_code", "PARTS HTS_code"),
+    ("fileName",                   "File Name"),
+    ("cevaInvoiceDate",            "CEVA INVOICE DATE"),
+    ("invoiceNumber",              "INVOICE NUMBER"),
+    ("entryNumber",                "ENTRY NUMBER"),
+    ("departureDate",              "DEPARTURE DATE"),
+    ("arrivalDate",                "ARRIVAL DATE"),
+    ("descriptionOfGoods",         "DESCRIPTION OF GOODS"),
+    ("totalEnteredValue",          "TOTAL ENTERED VALUE"),
+    ("totalOtherFees",             "TOTAL OTHER FEES"),
+    ("duty",                       "DUTY"),
+    ("supplier",                   "SUPPLIER"),
+    ("parts_Invoice_Seq",          "PARTS Invoice_Seq"),
+    ("parts_Invoice_Number",       "PARTS Invoice_Number"),
+    ("parts_Part_No",              "PARTS Part_No"),
+    ("parts_HTS_code",             "PARTS HTS_code"),
     ("parts_Description_of_Goods", "PARTS Description_of_Goods"),
 ]
 
 def _safe_to_cell(v: Any) -> Any:
-    """
-    Excel-safe: primitives stay; dict/list become JSON string.
-    """
     if v is None:
         return ""
     if isinstance(v, (str, int, float, bool)):
@@ -498,6 +483,23 @@ def _safe_to_cell(v: Any) -> Any:
         return json.dumps(v, ensure_ascii=False)
     except Exception:
         return str(v)
+
+
+def _join_all_line_item_values(line_items: List[dict], field: str) -> str:
+    """
+    Collect `field` from every line item and join distinct non-empty values
+    with ", ". Used so all parts are visible in summary columns, not just row 0.
+    e.g. ["6492804", "6492806", "6585584"] => "6492804, 6492806, 6585584"
+    """
+    seen = []
+    for item in (line_items or []):
+        v = item.get(field)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s not in seen:
+            seen.append(s)
+    return ", ".join(seen)
 
 
 # -------------------------
@@ -509,8 +511,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
     if not files:
         return func.HttpResponse(
             json.dumps({"error": "Upload files via multipart/form-data field 'files'"}),
-            status_code=400,
-            mimetype="application/json",
+            status_code=400, mimetype="application/json",
         )
 
     bsc = blob_service()
@@ -548,15 +549,12 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
                         pdf_bytes = z.read(zi)
                         leaf = inner.split("/")[-1].split("\\")[-1] or "file.pdf"
                         jobs.append(enqueue_one_pdf(pdf_bytes, leaf))
-
             elif _is_pdf_filename(filename):
                 jobs.append(enqueue_one_pdf(data, filename))
-
             else:
                 return func.HttpResponse(
                     json.dumps({"error": f"Unsupported file type: {filename}. Upload PDF or ZIP containing PDFs."}),
-                    status_code=400,
-                    mimetype="application/json",
+                    status_code=400, mimetype="application/json",
                 )
 
         resp = {"batchId": batch_id, "jobs": jobs}
@@ -583,11 +581,9 @@ def job_worker(msg: func.QueueMessage) -> None:
 
     container = cosmos_container()
     uploads = blob_service().get_container_client(UPLOADS_CONTAINER)
-
     created_at = utc_now_iso()
 
     try:
-        # Create processing doc
         container.upsert_item({
             "id": job_id,
             "type": "bundle_result",
@@ -602,10 +598,9 @@ def job_worker(msg: func.QueueMessage) -> None:
         pdf_bytes = uploads.get_blob_client(pdf_blob_path).download_blob().readall()
         pages = split_pdf_to_single_pages(pdf_bytes)
         total_pages = len(pages)
-
         client = di_client()
 
-        # 1) Classification per page
+        # 1) Classify each page
         page_results = []
         failures = []
         for item in pages:
@@ -613,9 +608,7 @@ def job_worker(msg: func.QueueMessage) -> None:
             one_pdf = item["pdfBytes"]
             try:
                 poller = client.begin_classify_document(
-                    CLASSIFIER_ID,
-                    body=one_pdf,
-                    content_type="application/pdf",
+                    CLASSIFIER_ID, body=one_pdf, content_type="application/pdf",
                 )
                 result = poller.result()
                 docs = getattr(result, "documents", None) or []
@@ -625,13 +618,11 @@ def job_worker(msg: func.QueueMessage) -> None:
                     conf = getattr(d0, "confidence", None)
                 else:
                     doc_type, conf = None, None
-
                 page_results.append({"pageNumber": pno, "docType": doc_type, "confidence": conf, "pdf": one_pdf})
-
             except Exception as e:
                 failures.append({"pageNumber": pno, "error": str(e)})
 
-        # 2) Pick best page per target
+        # 2) Pick best page per target doc type
         best_pages = {}
         for target in TARGET_DOC_TYPES:
             matches = [
@@ -643,7 +634,7 @@ def job_worker(msg: func.QueueMessage) -> None:
             if matches:
                 best_pages[target] = matches[0]
 
-        # 3) Extraction
+        # 3) Extract fields
         merged = {}
         picked_pages = {}
         confidence = {}
@@ -656,9 +647,7 @@ def job_worker(msg: func.QueueMessage) -> None:
 
             def analyze(pdf_bytes_to_use: bytes):
                 poller = client.begin_analyze_document(
-                    model_id,
-                    body=pdf_bytes_to_use,
-                    content_type="application/pdf",
+                    model_id, body=pdf_bytes_to_use, content_type="application/pdf",
                 )
                 return poller.result()
 
@@ -672,29 +661,24 @@ def job_worker(msg: func.QueueMessage) -> None:
                     rotated = rotate_pdf_bytes(info["pdf"], ROTATION_FALLBACK_DEGREES)
                     analyze2 = analyze(rotated)
                     simplified2 = simplify_analyze_result(analyze2)
-
                     if simplified2.get("hasData", False) and len(simplified2.get("fields", {})) >= len(simplified.get("fields", {})):
                         simplified = simplified2
                         used_rotation = ROTATION_FALLBACK_DEGREES
                 except Exception:
                     pass
 
-            key = safe_slug(doc_type).lower()   # ceva / entry_summary / parts_worksheet
+            key = safe_slug(doc_type).lower()
             fields = simplified.get("fields", {})
 
-            # FIX: For parts_worksheet, ensure LineItems is stored as a clean
-            # plain list of dicts, not a raw DI wrapper object.
-            # This handles both cases:
-            #   - Residual wrappers that survived _normalize_di_wrapped_value
-            #   - Any future SDK changes that return wrapped structures
+            # FIX: Normalize parts_worksheet LineItems into a clean plain list.
+            # Handles DI wrapper objects, content-only fields, and deduplicates
+            # space-joined repeated values from multi-span OCR extraction.
             if key == "parts_worksheet":
                 fields = _fix_parts_worksheet_line_items(fields)
 
             merged[key] = fields
-
             picked_pages[doc_type] = info.get("pageNumber")
             confidence[doc_type] = info.get("confidence")
-
             extracted_docs.append({
                 "docType": doc_type,
                 "modelId": model_id,
@@ -722,13 +706,8 @@ def job_worker(msg: func.QueueMessage) -> None:
             "extractedDocs": extracted_docs,
             **merged,
         }
-
-        # top-level queryable invoice date
         final_doc["cevaInvoiceDate"] = _extract_ceva_invoice_date(final_doc)
-
         container.upsert_item(final_doc)
-
-        # cleanup uploads
         delete_prefix(uploads, f"{job_id}/")
 
     except Exception as e:
@@ -755,7 +734,6 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(json.dumps({"error": "Missing jobId"}), status_code=400, mimetype="application/json")
 
     container = cosmos_container()
-
     try:
         doc = container.read_item(item=job_id, partition_key=job_id)
     except CosmosResourceNotFoundError:
@@ -771,20 +749,13 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
             out["failedAt"] = doc.get("failedAt")
         return func.HttpResponse(json.dumps(out, default=str), status_code=200, mimetype="application/json")
 
-    # completed doc: remove cosmos internal metadata keys
     def strip_internal(d: dict) -> dict:
         if not isinstance(d, dict):
             return d
-        out = {}
-        for k, v in d.items():
-            if k.startswith("_"):
-                continue
-            out[k] = v
-        return out
+        return {k: v for k, v in d.items() if not k.startswith("_")}
 
-    # FIX: also apply _fix_parts_worksheet_line_items when serving the UI response,
-    # so that old Cosmos docs (with wrapped LineItems) also render correctly in
-    # the frontend without needing reprocessing.
+    # Apply fix when serving old Cosmos docs so the detail view also renders
+    # correctly without needing reprocessing.
     pw_raw = strip_internal(doc.get("parts_worksheet") or {})
     pw_fixed = _fix_parts_worksheet_line_items(pw_raw)
 
@@ -799,7 +770,6 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
         "entry_summary": strip_internal(doc.get("entry_summary") or {}),
         "parts_worksheet": pw_fixed,
     }
-
     return func.HttpResponse(json.dumps(out, default=str), status_code=200, mimetype="application/json")
 
 
@@ -822,11 +792,9 @@ def _build_filters_from_req(req: func.HttpRequest):
     if q:
         where.append("CONTAINS(LOWER(c.fileName), LOWER(@q))")
         params.append({"name": "@q", "value": q})
-
     if invoice_from:
         where.append("IS_DEFINED(c.cevaInvoiceDate) AND c.cevaInvoiceDate >= @invFrom")
         params.append({"name": "@invFrom", "value": invoice_from})
-
     if invoice_to:
         where.append("IS_DEFINED(c.cevaInvoiceDate) AND c.cevaInvoiceDate <= @invTo")
         params.append({"name": "@invTo", "value": invoice_to})
@@ -836,7 +804,9 @@ def _build_filters_from_req(req: func.HttpRequest):
 
 # -------------------------
 # HTTP: RESULTS LIST (PAGINATED)
-# GET /api/results?pageSize=20&token=...&range=last_month&invoiceFrom=YYYY-MM-DD&invoiceTo=YYYY-MM-DD
+# Returns full LineItems array from Cosmos, then post-processes server-side:
+#   - fixes any wrapped LineItems (old docs)
+#   - builds comma-joined summary columns across ALL line items (not just [0])
 # -------------------------
 @app.route(route="results", methods=["GET"])
 def list_results(req: func.HttpRequest) -> func.HttpResponse:
@@ -848,10 +818,7 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
 
     where_clause, params = _build_filters_from_req(req)
 
-    # NOTE: For new uploads, parts_worksheet.LineItems is now a clean list,
-    # so LineItems[0].field_name queries work correctly.
-    # Old docs with wrapped LineItems will return null for these columns in the
-    # list view (this is acceptable — reprocess old docs to fix them fully).
+    # Pull full LineItems array so we can join all values, not just [0]
     query = f"""
     SELECT
       c.id,
@@ -866,11 +833,7 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
       c.entry_summary.Total_Other_Fees AS totalOtherFees,
       c.entry_summary.Duty AS duty,
       c.parts_worksheet.Supplier AS supplier,
-      c.parts_worksheet.LineItems[0].Invoice_Seq AS parts_Invoice_Seq,
-      c.parts_worksheet.LineItems[0].Invoice_Number AS parts_Invoice_Number,
-      c.parts_worksheet.LineItems[0].Part_No AS parts_Part_No,
-      c.parts_worksheet.LineItems[0].HTS_code AS parts_HTS_code,
-      c.parts_worksheet.LineItems[0].Description_of_Goods AS parts_Description_of_Goods
+      c.parts_worksheet.LineItems AS lineItems
     FROM c
     WHERE {where_clause}
     ORDER BY c.cevaInvoiceDate DESC
@@ -883,34 +846,43 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=True,
             max_item_count=page_size,
         )
-
         page_iter = items_iterable.by_page(continuation_token=token)
         page = next(page_iter)
-        items = list(page)
+        raw_items = list(page)
         next_token = getattr(page, "continuation_token", None)
+
+        # Post-process: fix wrapped LineItems (old docs), build comma-joined columns
+        items = []
+        for item in raw_items:
+            li_raw = item.pop("lineItems", None) or []
+            pw_shell = _fix_parts_worksheet_line_items({"LineItems": li_raw})
+            line_items = pw_shell.get("LineItems") or []
+
+            item["parts_Invoice_Seq"]           = _join_all_line_item_values(line_items, "Invoice_Seq")
+            item["parts_Invoice_Number"]        = _join_all_line_item_values(line_items, "Invoice_Number")
+            item["parts_Part_No"]               = _join_all_line_item_values(line_items, "Part_No")
+            item["parts_HTS_code"]              = _join_all_line_item_values(line_items, "HTS_code")
+            item["parts_Description_of_Goods"]  = _join_all_line_item_values(line_items, "Description_of_Goods")
+            items.append(item)
 
         return func.HttpResponse(
             json.dumps({"items": items, "continuationToken": next_token}, default=str),
-            mimetype="application/json",
-            status_code=200,
+            mimetype="application/json", status_code=200,
         )
 
     except StopIteration:
         return func.HttpResponse(
             json.dumps({"items": [], "continuationToken": None}),
-            mimetype="application/json",
-            status_code=200,
+            mimetype="application/json", status_code=200,
         )
     except Exception as e:
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
 
 
 # -------------------------
-# EXCEL EXPORT (ALL MATCHES)
-# GET /api/results/excel?range=...&invoiceFrom=...&invoiceTo=...
-# Produces:
-#   - "Summary" sheet: same columns as website table
-#   - "LineItems" sheet: all line items per job
+# EXCEL EXPORT
+# Summary sheet: all parts joined with ", " (consistent with UI table)
+# LineItems sheet: one row per line item (full granularity)
 # -------------------------
 def _autosize_columns(ws, max_col: int, max_width: int = 60):
     for col_idx in range(1, max_col + 1):
@@ -942,74 +914,51 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         items_iterable = container.query_items(
-            query=query,
-            parameters=params,
-            enable_cross_partition_query=True,
-            max_item_count=200,
+            query=query, parameters=params,
+            enable_cross_partition_query=True, max_item_count=200,
         )
-
         all_docs = []
         for page in items_iterable.by_page():
             all_docs.extend(list(page))
 
         wb = Workbook()
-
-        # Summary sheet
         ws = wb.active
         ws.title = "Summary"
-        headers = [label for _, label in SUMMARY_COLS]
-        ws.append(headers)
+        ws.append([label for _, label in SUMMARY_COLS])
 
-        # LineItems sheet
         ws_li = wb.create_sheet("LineItems")
-        ws_li.append([
-            "File Name",
-            "CEVA INVOICE DATE",
-            "Invoice_Seq",
-            "Invoice_Number",
-            "Part_No",
-            "HTS_code",
-            "Description_of_Goods",
-        ])
+        ws_li.append(["File Name", "CEVA INVOICE DATE", "Invoice_Seq",
+                       "Invoice_Number", "Part_No", "HTS_code", "Description_of_Goods"])
 
         for d in all_docs:
             ceva = d.get("ceva") if isinstance(d.get("ceva"), dict) else {}
-            es = d.get("entry_summary") if isinstance(d.get("entry_summary"), dict) else {}
-            pw = d.get("parts_worksheet") if isinstance(d.get("parts_worksheet"), dict) else {}
+            es   = d.get("entry_summary") if isinstance(d.get("entry_summary"), dict) else {}
+            pw   = d.get("parts_worksheet") if isinstance(d.get("parts_worksheet"), dict) else {}
 
-            # FIX: normalize LineItems at export time too.
-            # This ensures old Cosmos docs (with wrapped LineItems) also export
-            # correctly without needing reprocessing — belt-and-suspenders.
-            pw = _fix_parts_worksheet_line_items(dict(pw))  # copy to avoid mutating
-
-            line_items = pw.get("LineItems")
-            if not isinstance(line_items, list):
-                line_items = []
-
-            first = line_items[0] if line_items else {}
+            # Normalize LineItems at export time — fixes old docs without reprocessing
+            pw = _fix_parts_worksheet_line_items(dict(pw))
+            line_items = pw.get("LineItems") or []
 
             row = {
-                "fileName": d.get("fileName"),
-                "cevaInvoiceDate": d.get("cevaInvoiceDate"),
-                "invoiceNumber": ceva.get("INVOICE NUMBER"),
-                "entryNumber": ceva.get("ENTRY NUMBER"),
-                "departureDate": ceva.get("DEPARTURE DATE"),
-                "arrivalDate": ceva.get("ARRIVAL DATE"),
-                "descriptionOfGoods": ceva.get("DESCRIPTION OF GOODS"),
-                "totalEnteredValue": es.get("Total_Entered_Value"),
-                "totalOtherFees": es.get("Total_Other_Fees"),
-                "duty": es.get("Duty"),
-                "supplier": pw.get("Supplier"),
-                "parts_Invoice_Seq": (first or {}).get("Invoice_Seq"),
-                "parts_Invoice_Number": (first or {}).get("Invoice_Number"),
-                "parts_Part_No": (first or {}).get("Part_No"),
-                "parts_HTS_code": (first or {}).get("HTS_code"),
-                "parts_Description_of_Goods": (first or {}).get("Description_of_Goods"),
+                "fileName":                    d.get("fileName"),
+                "cevaInvoiceDate":             d.get("cevaInvoiceDate"),
+                "invoiceNumber":               ceva.get("INVOICE NUMBER"),
+                "entryNumber":                 ceva.get("ENTRY NUMBER"),
+                "departureDate":               ceva.get("DEPARTURE DATE"),
+                "arrivalDate":                 ceva.get("ARRIVAL DATE"),
+                "descriptionOfGoods":          ceva.get("DESCRIPTION OF GOODS"),
+                "totalEnteredValue":           es.get("Total_Entered_Value"),
+                "totalOtherFees":              es.get("Total_Other_Fees"),
+                "duty":                        es.get("Duty"),
+                "supplier":                    pw.get("Supplier"),
+                "parts_Invoice_Seq":           _join_all_line_item_values(line_items, "Invoice_Seq"),
+                "parts_Invoice_Number":        _join_all_line_item_values(line_items, "Invoice_Number"),
+                "parts_Part_No":               _join_all_line_item_values(line_items, "Part_No"),
+                "parts_HTS_code":              _join_all_line_item_values(line_items, "HTS_code"),
+                "parts_Description_of_Goods":  _join_all_line_item_values(line_items, "Description_of_Goods"),
             }
-
             ws.append([_safe_to_cell(row.get(key)) for key, _ in SUMMARY_COLS])
 
-            # All line items sheet
             for item in line_items:
                 if not isinstance(item, dict):
                     continue
@@ -1023,29 +972,26 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
                     _safe_to_cell(item.get("Description_of_Goods")),
                 ])
 
-        _autosize_columns(ws, len(headers))
+        _autosize_columns(ws, len(SUMMARY_COLS))
         _autosize_columns(ws_li, 7)
 
         out = io.BytesIO()
         wb.save(out)
         out.seek(0)
 
-        range_key = (req.params.get("range") or "all").strip()
+        range_key    = (req.params.get("range") or "all").strip()
         invoice_from = _parse_iso_date_only(req.params.get("invoiceFrom"))
-        invoice_to = _parse_iso_date_only(req.params.get("invoiceTo"))
-
+        invoice_to   = _parse_iso_date_only(req.params.get("invoiceTo"))
         suffix = range_key.lower() if range_key else "all"
         if invoice_from or invoice_to:
             suffix = f"{invoice_from or '...'}_to_{invoice_to or '...'}"
 
         filename = f"bundle_export_{suffix}.xlsx"
-        headers_resp = {"Content-Disposition": f'attachment; filename="{filename}"'}
-
         return func.HttpResponse(
             body=out.getvalue(),
             status_code=200,
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=headers_resp,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     except Exception as e:
