@@ -16,6 +16,10 @@
     button { padding: 6px 10px; cursor:pointer; }
     input[type="text"], input[type="date"], select { padding: 6px; }
     tr.clickable:hover { background:#f2f7ff; cursor:pointer; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid #ddd; }
+    .pill.ok { border-color:#0a7a0a; }
+    .pill.err { border-color:#b00020; }
+    .pill.processing { border-color:#d97706; }
     .small { font-size: 12px; }
     .widewrap { overflow:auto; max-height: 520px; border:1px solid #eee; }
   </style>
@@ -47,12 +51,12 @@
 <div class="box">
   <div class="row">
     <h3 style="margin:0;">Processed Bundles</h3>
-    <span class="muted small">Quick filters = Created date. Invoice filters = CEVA INVOICE DATE.</span>
+    <span class="muted small">Invoice filters = CEVA INVOICE DATE.</span>
   </div>
 
   <div class="row">
-    <label class="small">Quick (CreatedAt):</label>
-    <select id="createdRange">
+    <label class="small">Quick (Invoice Date):</label>
+    <select id="range">
       <option value="all">All</option>
       <option value="last_7_days">Last 7 days</option>
       <option value="last_30_days">Last 30 days</option>
@@ -93,27 +97,51 @@
 let continuationToken = null;
 let currentJobPolling = null;
 
+// These are the columns YOU asked for (main list table)
+const COLS = [
+  { key: "fileName", label: "File Name" },
+  { key: "cevaInvoiceDate", label: "CEVA INVOICE DATE" },
+  { key: "invoiceNumber", label: "INVOICE NUMBER" },
+  { key: "entryNumber", label: "ENTRY NUMBER" },
+  { key: "departureDate", label: "DEPARTURE DATE" },
+  { key: "arrivalDate", label: "ARRIVAL DATE" },
+  { key: "descriptionOfGoods", label: "DESCRIPTION OF GOODS" },
+  { key: "totalEnteredValue", label: "TOTAL ENTERED VALUE" },
+  { key: "totalOtherFees", label: "TOTAL OTHER FEES" },
+  { key: "duty", label: "DUTY" },
+  { key: "supplier", label: "SUPPLIER" },
+
+  // Parts Worksheet summaries (joined strings)
+  { key: "partsInvoiceSeq", label: "PARTS Invoice_Seq" },
+  { key: "partsInvoiceNumber", label: "PARTS Invoice_Number" },
+  { key: "partsPartNo", label: "PARTS Part_No" },
+  { key: "partsHTS", label: "PARTS HTS_code" },
+  { key: "partsDescription", label: "PARTS Description_of_Goods" },
+];
+
 function apiBase() {
   return "https://yavi-b4bahkdqced4ayhh.canadacentral-01.azurewebsites.net/api";
 }
 
-// Columns you requested (NO jobId/status/created)
-const COLS = [
-  { label: "File Name", key: "fileName" },
-  { label: "CEVA INVOICE DATE", key: "cevaInvoiceDate" },
+function getFilters() {
+  return {
+    range: document.getElementById("range").value,
+    invoiceFrom: document.getElementById("invoiceFrom").value,
+    invoiceTo: document.getElementById("invoiceTo").value,
+  };
+}
 
-  { label: "INVOICE NUMBER", flat: "ceva.INVOICE NUMBER" },
-  { label: "ENTRY NUMBER", flat: "ceva.ENTRY NUMBER" },
-  { label: "DEPARTURE DATE", flat: "ceva.DEPARTURE DATE" },
-  { label: "ARRIVAL DATE", flat: "ceva.ARRIVAL DATE" },
-  { label: "DESCRIPTION OF GOODS", flat: "ceva.DESCRIPTION OF GOODS" },
+function buildResultsUrl(pageSize=20) {
+  const { range, invoiceFrom, invoiceTo } = getFilters();
+  let url = `${apiBase()}/results?pageSize=${pageSize}`;
 
-  { label: "TOTAL ENTERED VALUE", flat: "entry_summary.Total_Entered_Value" },
-  { label: "TOTAL OTHER FEES", flat: "entry_summary.Total_Other_Fees" },
-  { label: "DUTY", flat: "entry_summary.Duty" },
+  if (range && range !== "all") url += `&range=${encodeURIComponent(range)}`;
+  if (invoiceFrom) url += `&invoiceFrom=${encodeURIComponent(invoiceFrom)}`;
+  if (invoiceTo) url += `&invoiceTo=${encodeURIComponent(invoiceTo)}`;
 
-  { label: "SUPPLIER", flat: "parts_worksheet.Supplier" },
-];
+  if (continuationToken) url += `&token=${encodeURIComponent(continuationToken)}`;
+  return url;
+}
 
 function setHeaders() {
   const tr = document.getElementById("resultsHeader");
@@ -123,26 +151,6 @@ function setHeaders() {
     th.textContent = c.label;
     tr.appendChild(th);
   });
-}
-
-function getFilters() {
-  return {
-    createdRange: document.getElementById("createdRange").value,
-    invoiceFrom: document.getElementById("invoiceFrom").value,
-    invoiceTo: document.getElementById("invoiceTo").value,
-  };
-}
-
-function buildResultsUrl(pageSize=20) {
-  const { createdRange, invoiceFrom, invoiceTo } = getFilters();
-  let url = `${apiBase()}/results?pageSize=${pageSize}`;
-
-  if (createdRange && createdRange !== "all") url += `&createdRange=${encodeURIComponent(createdRange)}`;
-  if (invoiceFrom) url += `&invoiceFrom=${encodeURIComponent(invoiceFrom)}`;
-  if (invoiceTo) url += `&invoiceTo=${encodeURIComponent(invoiceTo)}`;
-
-  if (continuationToken) url += `&token=${encodeURIComponent(continuationToken)}`;
-  return url;
 }
 
 async function uploadFiles() {
@@ -173,10 +181,10 @@ async function uploadFiles() {
     }
 
     const data = JSON.parse(text);
-
     const jobs = data.jobs || [];
+
+    statusEl.className = "ok";
     if (data.jobId) {
-      statusEl.className = "ok";
       statusEl.textContent = `Uploaded. Job ID: ${data.jobId}`;
       document.getElementById("jobIdInput").value = data.jobId;
       await refreshResults();
@@ -184,15 +192,12 @@ async function uploadFiles() {
       return;
     }
 
-    statusEl.className = "ok";
     statusEl.textContent = `Uploaded ZIP batch (${data.batchId}). Created ${jobs.length} job(s).`;
     await refreshResults();
-
     if (jobs.length) {
       document.getElementById("jobIdInput").value = jobs[0].jobId;
       loadJob(jobs[0].jobId);
     }
-
   } catch (e) {
     statusEl.className = "err";
     statusEl.textContent = "Connection error while uploading: " + e;
@@ -208,6 +213,8 @@ async function loadResults(reset=false) {
     continuationToken = null;
     document.getElementById("resultsTable").innerHTML = "";
   }
+
+  setHeaders();
 
   const url = buildResultsUrl(20);
   const res = await fetch(url);
@@ -229,19 +236,12 @@ async function loadResults(reset=false) {
     tr.className = "clickable";
     tr.onclick = () => loadJob(item.id);
 
-    const flat = item.flattened || {};
-
-    tr.innerHTML = COLS.map(c => {
-      if (c.key) return `<td>${item[c.key] ?? ""}</td>`;
-      if (c.flat) return `<td>${flat[c.flat] ?? ""}</td>`;
-      return "<td></td>";
-    }).join("");
-
+    tr.innerHTML = COLS.map(c => `<td>${item[c.key] ?? ""}</td>`).join("");
     tbody.appendChild(tr);
   });
 
   if (!items.length && reset) {
-    listStatus.textContent = "No results for these filters.";
+    listStatus.textContent = "No results for these filters. Try range=All or remove invoice date filters.";
   } else {
     listStatus.textContent = `Loaded ${items.length} row(s).`;
   }
@@ -264,7 +264,7 @@ async function applyFilters() {
 }
 
 async function clearFilters() {
-  document.getElementById("createdRange").value = "all";
+  document.getElementById("range").value = "all";
   document.getElementById("invoiceFrom").value = "";
   document.getElementById("invoiceTo").value = "";
   continuationToken = null;
@@ -272,10 +272,10 @@ async function clearFilters() {
 }
 
 function downloadExcelFiltered() {
-  const { createdRange, invoiceFrom, invoiceTo } = getFilters();
+  const { range, invoiceFrom, invoiceTo } = getFilters();
   const params = [];
 
-  if (createdRange && createdRange !== "all") params.push(`createdRange=${encodeURIComponent(createdRange)}`);
+  if (range && range !== "all") params.push(`range=${encodeURIComponent(range)}`);
   if (invoiceFrom) params.push(`invoiceFrom=${encodeURIComponent(invoiceFrom)}`);
   if (invoiceTo) params.push(`invoiceTo=${encodeURIComponent(invoiceTo)}`);
 
@@ -379,7 +379,7 @@ function renderPartsWorksheet(obj) {
   return html;
 }
 
-setHeaders();
+// initial load
 refreshResults();
 </script>
 </body>
