@@ -18,6 +18,7 @@
     tr.clickable:hover { background:#f2f7ff; cursor:pointer; }
     .small { font-size: 12px; }
     .widewrap { overflow:auto; max-height: 520px; border:1px solid #eee; }
+    .section { margin-bottom: 20px; }
   </style>
 </head>
 <body>
@@ -97,25 +98,22 @@ function apiBase() {
   return "https://yavi-b4bahkdqced4ayhh.canadacentral-01.azurewebsites.net/api";
 }
 
-// Exact columns you requested (including Parts Worksheet preview fields)
 const COLS = [
-  { key: "fileName", label: "File Name" },
-  { key: "cevaInvoiceDate", label: "CEVA INVOICE DATE" },
-  { key: "invoiceNumber", label: "INVOICE NUMBER" },
-  { key: "entryNumber", label: "ENTRY NUMBER" },
-  { key: "departureDate", label: "DEPARTURE DATE" },
-  { key: "arrivalDate", label: "ARRIVAL DATE" },
-  { key: "descriptionOfGoods", label: "DESCRIPTION OF GOODS" },
-  { key: "totalEnteredValue", label: "TOTAL ENTERED VALUE" },
-  { key: "totalOtherFees", label: "TOTAL OTHER FEES" },
-  { key: "duty", label: "DUTY" },
-  { key: "supplier", label: "SUPPLIER" },
-
-  // Parts Worksheet (first line item preview in list)
-  { key: "parts_Invoice_Seq", label: "PARTS Invoice_Seq" },
-  { key: "parts_Invoice_Number", label: "PARTS Invoice_Number" },
-  { key: "parts_Part_No", label: "PARTS Part_No" },
-  { key: "parts_HTS_code", label: "PARTS HTS_code" },
+  { key: "fileName",                   label: "File Name" },
+  { key: "cevaInvoiceDate",            label: "CEVA INVOICE DATE" },
+  { key: "invoiceNumber",              label: "INVOICE NUMBER" },
+  { key: "entryNumber",                label: "ENTRY NUMBER" },
+  { key: "departureDate",              label: "DEPARTURE DATE" },
+  { key: "arrivalDate",                label: "ARRIVAL DATE" },
+  { key: "descriptionOfGoods",         label: "DESCRIPTION OF GOODS" },
+  { key: "totalEnteredValue",          label: "TOTAL ENTERED VALUE" },
+  { key: "totalOtherFees",             label: "TOTAL OTHER FEES" },
+  { key: "duty",                       label: "DUTY" },
+  { key: "supplier",                   label: "SUPPLIER" },
+  { key: "parts_Invoice_Seq",          label: "PARTS Invoice_Seq" },
+  { key: "parts_Invoice_Number",       label: "PARTS Invoice_Number" },
+  { key: "parts_Part_No",              label: "PARTS Part_No" },
+  { key: "parts_HTS_code",             label: "PARTS HTS_code" },
   { key: "parts_Description_of_Goods", label: "PARTS Description_of_Goods" },
 ];
 
@@ -153,7 +151,6 @@ function downloadExcel() {
   if (range && range !== "all") params.push(`range=${encodeURIComponent(range)}`);
   if (invoiceFrom) params.push(`invoiceFrom=${encodeURIComponent(invoiceFrom)}`);
   if (invoiceTo) params.push(`invoiceTo=${encodeURIComponent(invoiceTo)}`);
-
   const url = `${apiBase()}/results/excel` + (params.length ? `?${params.join("&")}` : "");
   window.location.href = url;
 }
@@ -172,7 +169,6 @@ async function uploadFiles() {
 
   const fd = new FormData();
   for (const f of el.files) fd.append("files", f);
-
   statusEl.textContent = "Uploading...";
 
   try {
@@ -205,7 +201,6 @@ async function uploadFiles() {
       document.getElementById("jobIdInput").value = jobs[0].jobId;
       loadJob(jobs[0].jobId);
     }
-
   } catch (e) {
     statusEl.className = "err";
     statusEl.textContent = "Connection error while uploading: " + e;
@@ -234,15 +229,14 @@ async function loadResults(reset=false) {
 
   const items = data.items || [];
   continuationToken = data.continuationToken;
-
   const tbody = document.getElementById("resultsTable");
 
   items.forEach(item => {
     const tr = document.createElement("tr");
     tr.className = "clickable";
     tr.onclick = () => loadJob(item.id);
-
-    tr.innerHTML = COLS.map(c => `<td>${item[c.key] ?? ""}</td>`).join("");
+    // safeCell: never render raw objects — stringify if needed
+    tr.innerHTML = COLS.map(c => `<td>${safeCell(item[c.key])}</td>`).join("");
     tbody.appendChild(tr);
   });
 
@@ -254,6 +248,21 @@ async function loadResults(reset=false) {
 
   document.getElementById("moreHint").textContent =
     continuationToken ? "More available…" : "End of list.";
+}
+
+/**
+ * safeCell: convert any value to a safe HTML string for table cells.
+ * - null/undefined => ""
+ * - string/number  => as-is
+ * - array of strings => join with ", "
+ * - object         => JSON string (never [object Object])
+ */
+function safeCell(v) {
+  if (v == null) return "";
+  if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return v.map(safeCell).join(", ");
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
 }
 
 function loadMore() {
@@ -341,34 +350,71 @@ function renderDetails(data) {
 function renderSection(title, obj) {
   let html = `<div class="section"><h3>${title}</h3><table>`;
   for (const key in (obj || {})) {
-    html += `<tr><th>${key}</th><td>${obj[key] ?? ""}</td></tr>`;
+    html += `<tr><th>${key}</th><td>${safeCell(obj[key])}</td></tr>`;
   }
   html += "</table></div>";
   return html;
 }
 
+/**
+ * renderPartsWorksheet
+ *
+ * The backend now always sends LineItems as a clean array of plain dicts:
+ *   [{ Invoice_Seq: "SEQ 1", Invoice_Number: "42500097", Part_No: "6492804", ... }, ...]
+ *
+ * Each field value is a plain string — no [object Object].
+ * For old docs, the backend applies _fix_parts_worksheet_line_items before
+ * sending, so the frontend never needs to handle DI wrappers.
+ *
+ * Multi-value fields that DI joined with spaces are already deduped by the
+ * backend (e.g. "COOLER CORE COOLER CORE" => "COOLER CORE").
+ */
 function renderPartsWorksheet(obj) {
   let html = `<div class="section"><h3>Parts Worksheet</h3>`;
-  html += `<p><strong>Supplier:</strong> ${obj?.Supplier || ""}</p>`;
+  html += `<p><strong>Supplier:</strong> ${safeCell(obj?.Supplier)}</p>`;
 
   let lineItems = obj?.LineItems;
 
-  // Backward-compat in case old docs still have wrapper
-  if (lineItems && lineItems.valueArray) {
-    // convert DI wrapper {valueArray:[{valueObject:{...}}]} into list of plain objects
-    const arr = lineItems.valueArray || [];
-    lineItems = arr.map(x => x.valueObject || x);
+  // Backward-compat: if an old doc still slips through with DI wrapper,
+  // unwrap it client-side so it at least renders something.
+  if (lineItems && !Array.isArray(lineItems) && lineItems.valueArray) {
+    lineItems = lineItems.valueArray.map(x => {
+      const vo = x.valueObject || x;
+      // Unwrap each field value
+      const row = {};
+      for (const k in vo) {
+        const fv = vo[k];
+        if (fv && typeof fv === "object") {
+          // Try known value keys; fall back to content, then JSON
+          row[k] = fv.valueString ?? fv.valueNumber ?? fv.valueInteger
+                ?? fv.valueDate ?? fv.content ?? JSON.stringify(fv);
+        } else {
+          row[k] = fv ?? "";
+        }
+      }
+      return row;
+    });
   }
 
   if (Array.isArray(lineItems) && lineItems.length > 0) {
+    // Collect all field keys across all items (some items may have extra fields)
+    const allKeys = [];
+    lineItems.forEach(item => {
+      Object.keys(item || {}).forEach(k => {
+        if (!allKeys.includes(k)) allKeys.push(k);
+      });
+    });
+
     html += "<table><tr>";
-    const headers = Object.keys(lineItems[0] || {});
-    headers.forEach(h => html += `<th>${h}</th>`);
+    allKeys.forEach(h => html += `<th>${h}</th>`);
     html += "</tr>";
 
     lineItems.forEach(item => {
       html += "<tr>";
-      headers.forEach(h => html += `<td>${(item && item[h] != null) ? item[h] : ""}</td>`);
+      allKeys.forEach(h => {
+        const v = item ? item[h] : null;
+        html += `<td>${safeCell(v)}</td>`;
+      });
       html += "</tr>";
     });
 
