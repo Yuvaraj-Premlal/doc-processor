@@ -100,6 +100,9 @@
 let continuationToken = null;
 let currentJobPolling = null;
 
+// Keep a stable set of "all flattened keys seen so far" across paging
+const seenFlattenedKeys = new Set();
+
 // columns always shown (summary)
 const BASE_COLS = [
   { key: "id", label: "Job ID" },
@@ -107,7 +110,8 @@ const BASE_COLS = [
   { key: "cevaInvoiceDate", label: "CEVA INVOICE DATE" },
   { key: "createdAt", label: "Created" },
   { key: "status", label: "Status" },
-  // extra useful summary fields from flattened (if present)
+
+  // summary fields (from flattened)
   { key: "flattened.ceva.INVOICE NUMBER", label: "Invoice No" },
   { key: "flattened.ceva.ENTRY NUMBER", label: "Entry No" },
   { key: "flattened.parts_worksheet.Supplier", label: "Supplier" }
@@ -136,25 +140,12 @@ function buildResultsUrl(pageSize=20) {
   const { createdRange, invoiceFrom, invoiceTo } = getFilters();
   let url = `${apiBase()}/results?pageSize=${pageSize}`;
 
-  // IMPORTANT: createdRange should be sent as createdRange (new param)
   if (createdRange && createdRange !== "all") url += `&createdRange=${encodeURIComponent(createdRange)}`;
-
-  // Invoice-date filters (optional)
   if (invoiceFrom) url += `&invoiceFrom=${encodeURIComponent(invoiceFrom)}`;
   if (invoiceTo) url += `&invoiceTo=${encodeURIComponent(invoiceTo)}`;
-
   if (continuationToken) url += `&token=${encodeURIComponent(continuationToken)}`;
-  return url;
-}
 
-function getPath(obj, path) {
-  const parts = path.split(".");
-  let cur = obj;
-  for (const p of parts) {
-    if (cur == null) return null;
-    cur = cur[p];
-  }
-  return cur;
+  return url;
 }
 
 function setHeaders(cols) {
@@ -165,6 +156,30 @@ function setHeaders(cols) {
     th.textContent = c.label;
     tr.appendChild(th);
   });
+}
+
+function buildColumns(items) {
+  const { showAllCols } = getFilters();
+  let cols = [...BASE_COLS];
+
+  // always collect flattened keys seen so far (for stable "show all")
+  items.forEach(it => {
+    if (it.flattened && typeof it.flattened === "object") {
+      Object.keys(it.flattened).forEach(k => seenFlattenedKeys.add(k));
+    }
+  });
+
+  if (showAllCols) {
+    const extra = Array.from(seenFlattenedKeys).sort().map(k => ({
+      key: "flattened." + k,
+      label: k
+    }));
+
+    const baseKeySet = new Set(cols.map(c => c.key));
+    extra.forEach(c => { if (!baseKeySet.has(c.key)) cols.push(c); });
+  }
+
+  return cols;
 }
 
 async function uploadFiles() {
@@ -228,6 +243,7 @@ async function loadResults(reset=false) {
 
   if (reset) {
     continuationToken = null;
+    seenFlattenedKeys.clear();
     document.getElementById("resultsTable").innerHTML = "";
   }
 
@@ -244,32 +260,7 @@ async function loadResults(reset=false) {
   const items = data.items || [];
   continuationToken = data.continuationToken;
 
-  const { showAllCols } = getFilters();
-
-  // Build columns:
-  // - always show BASE_COLS
-  // - optionally add union of flattened keys from returned items (for visibility)
-  let cols = [...BASE_COLS];
-
-  if (showAllCols) {
-    const flatKeys = new Set();
-    items.forEach(it => {
-      if (it.flattened && typeof it.flattened === "object") {
-        Object.keys(it.flattened).forEach(k => flatKeys.add(k));
-      }
-    });
-
-    // add flattened keys as columns (capped to avoid insane tables)
-    const extra = Array.from(flatKeys).sort().slice(0, 120).map(k => ({
-      key: "flattened." + k,
-      label: k
-    }));
-
-    // Avoid duplicates of already-in BASE_COLS (same flattened keys)
-    const baseKeySet = new Set(cols.map(c => c.key));
-    extra.forEach(c => { if (!baseKeySet.has(c.key)) cols.push(c); });
-  }
-
+  const cols = buildColumns(items);
   setHeaders(cols);
 
   const tbody = document.getElementById("resultsTable");
@@ -283,11 +274,13 @@ async function loadResults(reset=false) {
 
     const tds = cols.map(c => {
       if (c.key === "status") return `<td><span class="pill ${cls}">${item.status || ""}</span></td>`;
+
       if (c.key.startsWith("flattened.")) {
         const k = c.key.replace("flattened.", "");
         const flat = item.flattened || {};
         return `<td>${(flat && flat[k] != null) ? flat[k] : ""}</td>`;
       }
+
       return `<td>${item[c.key] ?? ""}</td>`;
     });
 
@@ -408,14 +401,29 @@ function renderSection(title, obj) {
   return html;
 }
 
+function normalizeLineItems(lineItems) {
+  // New format: array of objects
+  if (Array.isArray(lineItems)) return lineItems;
+
+  // Old format: {type:"array", valueArray:[{type:"object", valueObject:{...}}]}
+  if (lineItems && typeof lineItems === "object") {
+    if (Array.isArray(lineItems.valueArray)) {
+      return lineItems.valueArray.map(x => {
+        if (x && typeof x === "object" && x.valueObject && typeof x.valueObject === "object") {
+          return x.valueObject;
+        }
+        return x;
+      });
+    }
+  }
+  return [];
+}
+
 function renderPartsWorksheet(obj) {
   let html = `<div class="section"><h3>Parts Worksheet</h3>`;
   html += `<p><strong>Supplier:</strong> ${obj?.Supplier || ""}</p>`;
 
-  let lineItems = obj?.LineItems;
-
-  // backward compat if old docs have wrapper
-  if (lineItems && lineItems.valueArray) lineItems = lineItems.valueArray;
+  const lineItems = normalizeLineItems(obj?.LineItems);
 
   if (Array.isArray(lineItems) && lineItems.length > 0) {
     html += "<table><tr>";
