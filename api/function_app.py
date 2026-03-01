@@ -142,9 +142,9 @@ def _parse_iso_date_only(s: Optional[str]) -> Optional[str]:
 
 
 # -------------------------
-# DI VALUE NORMALIZATION (CRITICAL FIX)
-# This converts DI wrapper objects into plain dict/list/string/number
-# so your HTML and Excel won't show [object Object] or crash.
+# DI VALUE NORMALIZATION
+# Converts DI wrapper objects into plain dict/list/string/number
+# so HTML and Excel won't show [object Object] or crash.
 # -------------------------
 def _jsonable(obj):
     if obj is None:
@@ -168,7 +168,8 @@ def _jsonable(obj):
 
     d = getattr(obj, "__dict__", None)
     if isinstance(d, dict) and d:
-        return {k: _jsonable(v) for v in d.items()}
+        # FIX: was `for v in d.items()` (bug — iterated tuples, ignored keys)
+        return {k: _jsonable(v) for k, v in d.items()}
 
     return str(obj)
 
@@ -185,7 +186,7 @@ def _normalize_di_wrapped_value(v: Any) -> Any:
     if isinstance(v, list):
         return [_normalize_di_wrapped_value(x) for x in v]
     if isinstance(v, dict):
-        # Common DI wrapper keys
+        # Common DI wrapper keys — extract the plain value directly
         if "valueString" in v:
             return v.get("valueString")
         if "valueNumber" in v:
@@ -211,13 +212,11 @@ def _normalize_di_wrapped_value(v: Any) -> Any:
         if "valueArray" in v and isinstance(v["valueArray"], list):
             out = []
             for item in v["valueArray"]:
-                # often: {"type":"object","valueObject":{...}} etc
                 out.append(_normalize_di_wrapped_value(item))
             return out
 
-        # If it's a dict but not an obvious wrapper, normalize children
-        # and also drop noisy geometry keys if present.
-        drop = {"boundingRegions", "polygon", "spans"}  # keep "content" out too (usually noise)
+        # Plain dict — normalize children, drop noisy geometry keys
+        drop = {"boundingRegions", "polygon", "spans"}
         clean = {}
         for k, val in v.items():
             if k in drop:
@@ -227,7 +226,6 @@ def _normalize_di_wrapped_value(v: Any) -> Any:
             clean[k] = _normalize_di_wrapped_value(val)
         return clean
 
-    # fallback: attempt jsonable conversion
     return _normalize_di_wrapped_value(_jsonable(v))
 
 def _field_value_simple(field):
@@ -238,12 +236,10 @@ def _field_value_simple(field):
     if field is None:
         return None
 
-    # New SDK: field.value holds python-like structures but can still contain wrapper dicts.
     value = getattr(field, "value", None)
     if value is not None:
         return _normalize_di_wrapped_value(_jsonable(value))
 
-    # Old: field.content
     content = getattr(field, "content", None)
     if content is not None:
         return content
@@ -262,6 +258,97 @@ def simplify_analyze_result(result):
 
     has_data = any(v not in (None, "", [], {}) for v in simple.values())
     return {"fields": simple, "hasData": has_data}
+
+
+# -------------------------
+# FIX: POST-PROCESS PARTS WORKSHEET
+# Ensures LineItems is always stored as a clean plain list of dicts,
+# regardless of whether the DI SDK returned a wrapped or unwrapped structure.
+# This runs AFTER simplify_analyze_result so it catches any residual wrappers.
+# -------------------------
+def _unwrap_line_item_field(fv: Any) -> Any:
+    """
+    Unwrap a single field value that may still be a DI wrapper dict.
+    e.g. {"type":"string","valueString":"SEQ 1",...} => "SEQ 1"
+    """
+    if fv is None:
+        return None
+    if isinstance(fv, (str, int, float, bool)):
+        return fv
+    if isinstance(fv, dict):
+        # Try all known scalar value keys
+        for key in ("valueString", "valueNumber", "valueInteger", "valueDate",
+                    "valueTime", "valueBoolean", "valuePhoneNumber", "valueSelectionMark"):
+            if key in fv:
+                return fv[key]
+        # Nested object — recurse
+        if "valueObject" in fv and isinstance(fv["valueObject"], dict):
+            return {k: _unwrap_line_item_field(v) for k, v in fv["valueObject"].items()}
+        if "valueArray" in fv and isinstance(fv["valueArray"], list):
+            return [_unwrap_line_item_field(i) for i in fv["valueArray"]]
+        # Fall back to content string
+        if "content" in fv:
+            return fv["content"]
+    return fv
+
+def _fix_parts_worksheet_line_items(pw_fields: dict) -> dict:
+    """
+    Takes the parts_worksheet fields dict and ensures LineItems is a clean
+    list of plain dicts. Handles three cases:
+
+      Case 1 — Already a clean list (new behavior after _normalize fix):
+        LineItems = [{"Invoice_Seq": "SEQ 1", ...}]  →  keep as-is
+
+      Case 2 — Still a DI wrapper dict (old/residual behavior):
+        LineItems = {"type":"array","valueArray":[{"type":"object","valueObject":{...}}]}
+        →  unwrap into clean list
+
+      Case 3 — Missing or None:
+        →  set to []
+    """
+    if not isinstance(pw_fields, dict):
+        return pw_fields
+
+    line_items = pw_fields.get("LineItems")
+
+    # Case 1: already a clean list
+    if isinstance(line_items, list):
+        # Defensively unwrap each item in case fields inside are still wrapped
+        clean = []
+        for item in line_items:
+            if isinstance(item, dict):
+                clean.append({k: _unwrap_line_item_field(v) for k, v in item.items()})
+            else:
+                clean.append(item)
+        pw_fields["LineItems"] = clean
+        return pw_fields
+
+    # Case 2: DI wrapper dict
+    if isinstance(line_items, dict) and "valueArray" in line_items:
+        raw_array = line_items["valueArray"]
+        if not isinstance(raw_array, list):
+            pw_fields["LineItems"] = []
+            return pw_fields
+
+        clean = []
+        for item in raw_array:
+            if not isinstance(item, dict):
+                continue
+            # Each item is {"type":"object","valueObject":{field_name: {type,valueString,...}}}
+            vo = item.get("valueObject", {})
+            if not isinstance(vo, dict):
+                continue
+            row = {}
+            for field_name, field_val in vo.items():
+                row[field_name] = _unwrap_line_item_field(field_val)
+            clean.append(row)
+
+        pw_fields["LineItems"] = clean
+        return pw_fields
+
+    # Case 3: missing/None/unexpected
+    pw_fields["LineItems"] = []
+    return pw_fields
 
 
 # -------------------------
@@ -593,7 +680,17 @@ def job_worker(msg: func.QueueMessage) -> None:
                     pass
 
             key = safe_slug(doc_type).lower()   # ceva / entry_summary / parts_worksheet
-            merged[key] = simplified.get("fields", {})
+            fields = simplified.get("fields", {})
+
+            # FIX: For parts_worksheet, ensure LineItems is stored as a clean
+            # plain list of dicts, not a raw DI wrapper object.
+            # This handles both cases:
+            #   - Residual wrappers that survived _normalize_di_wrapped_value
+            #   - Any future SDK changes that return wrapped structures
+            if key == "parts_worksheet":
+                fields = _fix_parts_worksheet_line_items(fields)
+
+            merged[key] = fields
 
             picked_pages[doc_type] = info.get("pageNumber")
             confidence[doc_type] = info.get("confidence")
@@ -603,7 +700,7 @@ def job_worker(msg: func.QueueMessage) -> None:
                 "modelId": model_id,
                 "page": info.get("pageNumber"),
                 "rotationAppliedDegrees": used_rotation,
-                "fieldCount": len(simplified.get("fields", {})),
+                "fieldCount": len(fields),
             })
 
         final_doc = {
@@ -666,7 +763,6 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
 
     status = doc.get("status")
     if status in ("processing", "failed"):
-        # keep lightweight responses for polling
         out = {"id": job_id, "status": status}
         if status == "processing":
             out["createdAt"] = doc.get("createdAt")
@@ -675,7 +771,7 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
             out["failedAt"] = doc.get("failedAt")
         return func.HttpResponse(json.dumps(out, default=str), status_code=200, mimetype="application/json")
 
-    # completed doc: remove cosmos internal metadata keys if present
+    # completed doc: remove cosmos internal metadata keys
     def strip_internal(d: dict) -> dict:
         if not isinstance(d, dict):
             return d
@@ -686,6 +782,12 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
             out[k] = v
         return out
 
+    # FIX: also apply _fix_parts_worksheet_line_items when serving the UI response,
+    # so that old Cosmos docs (with wrapped LineItems) also render correctly in
+    # the frontend without needing reprocessing.
+    pw_raw = strip_internal(doc.get("parts_worksheet") or {})
+    pw_fixed = _fix_parts_worksheet_line_items(pw_raw)
+
     out = {
         "id": doc.get("id"),
         "fileName": doc.get("fileName"),
@@ -695,7 +797,7 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
         "cevaInvoiceDate": doc.get("cevaInvoiceDate"),
         "ceva": strip_internal(doc.get("ceva") or {}),
         "entry_summary": strip_internal(doc.get("entry_summary") or {}),
-        "parts_worksheet": strip_internal(doc.get("parts_worksheet") or {}),
+        "parts_worksheet": pw_fixed,
     }
 
     return func.HttpResponse(json.dumps(out, default=str), status_code=200, mimetype="application/json")
@@ -703,12 +805,10 @@ def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
 
 # -------------------------
 # COSMOS QUERIES (LIST + EXCEL)
-# IMPORTANT: We return EXACT summary columns the UI shows.
-# No flattened/confidence objects => no empty cells & no excel conversion errors.
 # -------------------------
 def _build_filters_from_req(req: func.HttpRequest):
     q = req.params.get("q")
-    range_key = req.params.get("range")  # invoice date quick range
+    range_key = req.params.get("range")
     invoice_from = _parse_iso_date_only(req.params.get("invoiceFrom"))
     invoice_to = _parse_iso_date_only(req.params.get("invoiceTo"))
 
@@ -748,7 +848,10 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
 
     where_clause, params = _build_filters_from_req(req)
 
-    # Use bracket notation for CEVA keys with spaces
+    # NOTE: For new uploads, parts_worksheet.LineItems is now a clean list,
+    # so LineItems[0].field_name queries work correctly.
+    # Old docs with wrapped LineItems will return null for these columns in the
+    # list view (this is acceptable — reprocess old docs to fix them fully).
     query = f"""
     SELECT
       c.id,
@@ -781,7 +884,6 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
             max_item_count=page_size,
         )
 
-        # IMPORTANT FIX: do NOT pass max_item_count into by_page() (your SDK errors on that)
         page_iter = items_iterable.by_page(continuation_token=token)
         page = next(page_iter)
         items = list(page)
@@ -825,7 +927,6 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
     container = cosmos_container()
     where_clause, params = _build_filters_from_req(req)
 
-    # Pull enough to build both Summary + LineItems
     query = f"""
     SELECT
       c.id,
@@ -875,6 +976,11 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
             ceva = d.get("ceva") if isinstance(d.get("ceva"), dict) else {}
             es = d.get("entry_summary") if isinstance(d.get("entry_summary"), dict) else {}
             pw = d.get("parts_worksheet") if isinstance(d.get("parts_worksheet"), dict) else {}
+
+            # FIX: normalize LineItems at export time too.
+            # This ensures old Cosmos docs (with wrapped LineItems) also export
+            # correctly without needing reprocessing — belt-and-suspenders.
+            pw = _fix_parts_worksheet_line_items(dict(pw))  # copy to avoid mutating
 
             line_items = pw.get("LineItems")
             if not isinstance(line_items, list):
