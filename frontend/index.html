@@ -16,10 +16,6 @@
     button { padding: 6px 10px; cursor:pointer; }
     input[type="text"], input[type="date"], select { padding: 6px; }
     tr.clickable:hover { background:#f2f7ff; cursor:pointer; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid #ddd; }
-    .pill.ok { border-color:#0a7a0a; }
-    .pill.err { border-color:#b00020; }
-    .pill.processing { border-color:#d97706; }
     .small { font-size: 12px; }
     .widewrap { overflow:auto; max-height: 520px; border:1px solid #eee; }
   </style>
@@ -69,9 +65,6 @@
     <label class="small">Invoice To:</label>
     <input type="date" id="invoiceTo" />
 
-    <label class="small">Show all columns:</label>
-    <input type="checkbox" id="showAllCols" onchange="refreshResults()" />
-
     <button onclick="applyFilters()">Apply</button>
     <button onclick="clearFilters()">Clear</button>
     <button onclick="downloadExcelFiltered()">Download Excel</button>
@@ -100,40 +93,44 @@
 let continuationToken = null;
 let currentJobPolling = null;
 
-// Keep a stable set of "all flattened keys seen so far" across paging
-const seenFlattenedKeys = new Set();
-
-// columns always shown (summary)
-const BASE_COLS = [
-  { key: "id", label: "Job ID" },
-  { key: "fileName", label: "File Name" },
-  { key: "cevaInvoiceDate", label: "CEVA INVOICE DATE" },
-  { key: "createdAt", label: "Created" },
-  { key: "status", label: "Status" },
-
-  // summary fields (from flattened)
-  { key: "flattened.ceva.INVOICE NUMBER", label: "Invoice No" },
-  { key: "flattened.ceva.ENTRY NUMBER", label: "Entry No" },
-  { key: "flattened.parts_worksheet.Supplier", label: "Supplier" }
-];
-
 function apiBase() {
   return "https://yavi-b4bahkdqced4ayhh.canadacentral-01.azurewebsites.net/api";
 }
 
-function statusClass(status) {
-  if (status === "completed") return "ok";
-  if (status === "failed") return "err";
-  if (status === "processing") return "processing";
-  return "";
+// Columns you requested (NO jobId/status/created)
+const COLS = [
+  { label: "File Name", key: "fileName" },
+  { label: "CEVA INVOICE DATE", key: "cevaInvoiceDate" },
+
+  { label: "INVOICE NUMBER", flat: "ceva.INVOICE NUMBER" },
+  { label: "ENTRY NUMBER", flat: "ceva.ENTRY NUMBER" },
+  { label: "DEPARTURE DATE", flat: "ceva.DEPARTURE DATE" },
+  { label: "ARRIVAL DATE", flat: "ceva.ARRIVAL DATE" },
+  { label: "DESCRIPTION OF GOODS", flat: "ceva.DESCRIPTION OF GOODS" },
+
+  { label: "TOTAL ENTERED VALUE", flat: "entry_summary.Total_Entered_Value" },
+  { label: "TOTAL OTHER FEES", flat: "entry_summary.Total_Other_Fees" },
+  { label: "DUTY", flat: "entry_summary.Duty" },
+
+  { label: "SUPPLIER", flat: "parts_worksheet.Supplier" },
+];
+
+function setHeaders() {
+  const tr = document.getElementById("resultsHeader");
+  tr.innerHTML = "";
+  COLS.forEach(c => {
+    const th = document.createElement("th");
+    th.textContent = c.label;
+    tr.appendChild(th);
+  });
 }
 
 function getFilters() {
-  const createdRange = document.getElementById("createdRange").value;
-  const invoiceFrom = document.getElementById("invoiceFrom").value;
-  const invoiceTo = document.getElementById("invoiceTo").value;
-  const showAllCols = document.getElementById("showAllCols").checked;
-  return { createdRange, invoiceFrom, invoiceTo, showAllCols };
+  return {
+    createdRange: document.getElementById("createdRange").value,
+    invoiceFrom: document.getElementById("invoiceFrom").value,
+    invoiceTo: document.getElementById("invoiceTo").value,
+  };
 }
 
 function buildResultsUrl(pageSize=20) {
@@ -143,43 +140,9 @@ function buildResultsUrl(pageSize=20) {
   if (createdRange && createdRange !== "all") url += `&createdRange=${encodeURIComponent(createdRange)}`;
   if (invoiceFrom) url += `&invoiceFrom=${encodeURIComponent(invoiceFrom)}`;
   if (invoiceTo) url += `&invoiceTo=${encodeURIComponent(invoiceTo)}`;
+
   if (continuationToken) url += `&token=${encodeURIComponent(continuationToken)}`;
-
   return url;
-}
-
-function setHeaders(cols) {
-  const tr = document.getElementById("resultsHeader");
-  tr.innerHTML = "";
-  cols.forEach(c => {
-    const th = document.createElement("th");
-    th.textContent = c.label;
-    tr.appendChild(th);
-  });
-}
-
-function buildColumns(items) {
-  const { showAllCols } = getFilters();
-  let cols = [...BASE_COLS];
-
-  // always collect flattened keys seen so far (for stable "show all")
-  items.forEach(it => {
-    if (it.flattened && typeof it.flattened === "object") {
-      Object.keys(it.flattened).forEach(k => seenFlattenedKeys.add(k));
-    }
-  });
-
-  if (showAllCols) {
-    const extra = Array.from(seenFlattenedKeys).sort().map(k => ({
-      key: "flattened." + k,
-      label: k
-    }));
-
-    const baseKeySet = new Set(cols.map(c => c.key));
-    extra.forEach(c => { if (!baseKeySet.has(c.key)) cols.push(c); });
-  }
-
-  return cols;
 }
 
 async function uploadFiles() {
@@ -243,7 +206,6 @@ async function loadResults(reset=false) {
 
   if (reset) {
     continuationToken = null;
-    seenFlattenedKeys.clear();
     document.getElementById("resultsTable").innerHTML = "";
   }
 
@@ -260,9 +222,6 @@ async function loadResults(reset=false) {
   const items = data.items || [];
   continuationToken = data.continuationToken;
 
-  const cols = buildColumns(items);
-  setHeaders(cols);
-
   const tbody = document.getElementById("resultsTable");
 
   items.forEach(item => {
@@ -270,27 +229,19 @@ async function loadResults(reset=false) {
     tr.className = "clickable";
     tr.onclick = () => loadJob(item.id);
 
-    const cls = statusClass(item.status);
+    const flat = item.flattened || {};
 
-    const tds = cols.map(c => {
-      if (c.key === "status") return `<td><span class="pill ${cls}">${item.status || ""}</span></td>`;
+    tr.innerHTML = COLS.map(c => {
+      if (c.key) return `<td>${item[c.key] ?? ""}</td>`;
+      if (c.flat) return `<td>${flat[c.flat] ?? ""}</td>`;
+      return "<td></td>";
+    }).join("");
 
-      if (c.key.startsWith("flattened.")) {
-        const k = c.key.replace("flattened.", "");
-        const flat = item.flattened || {};
-        return `<td>${(flat && flat[k] != null) ? flat[k] : ""}</td>`;
-      }
-
-      return `<td>${item[c.key] ?? ""}</td>`;
-    });
-
-    tr.innerHTML = tds.join("");
     tbody.appendChild(tr);
   });
 
   if (!items.length && reset) {
-    listStatus.textContent =
-      "No results for these filters. Try Quick=All or remove invoice date filter.";
+    listStatus.textContent = "No results for these filters.";
   } else {
     listStatus.textContent = `Loaded ${items.length} row(s).`;
   }
@@ -401,31 +352,13 @@ function renderSection(title, obj) {
   return html;
 }
 
-function normalizeLineItems(lineItems) {
-  // New format: array of objects
-  if (Array.isArray(lineItems)) return lineItems;
-
-  // Old format: {type:"array", valueArray:[{type:"object", valueObject:{...}}]}
-  if (lineItems && typeof lineItems === "object") {
-    if (Array.isArray(lineItems.valueArray)) {
-      return lineItems.valueArray.map(x => {
-        if (x && typeof x === "object" && x.valueObject && typeof x.valueObject === "object") {
-          return x.valueObject;
-        }
-        return x;
-      });
-    }
-  }
-  return [];
-}
-
 function renderPartsWorksheet(obj) {
   let html = `<div class="section"><h3>Parts Worksheet</h3>`;
   html += `<p><strong>Supplier:</strong> ${obj?.Supplier || ""}</p>`;
 
-  const lineItems = normalizeLineItems(obj?.LineItems);
+  const lineItems = Array.isArray(obj?.LineItems) ? obj.LineItems : [];
 
-  if (Array.isArray(lineItems) && lineItems.length > 0) {
+  if (lineItems.length > 0) {
     html += "<table><tr>";
     const headers = Object.keys(lineItems[0] || {});
     headers.forEach(h => html += `<th>${h}</th>`);
@@ -446,6 +379,7 @@ function renderPartsWorksheet(obj) {
   return html;
 }
 
+setHeaders();
 refreshResults();
 </script>
 </body>
