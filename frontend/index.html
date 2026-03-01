@@ -16,10 +16,6 @@
     button { padding: 6px 10px; cursor:pointer; }
     input[type="text"], input[type="date"], select { padding: 6px; }
     tr.clickable:hover { background:#f2f7ff; cursor:pointer; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid #ddd; }
-    .pill.ok { border-color:#0a7a0a; }
-    .pill.err { border-color:#b00020; }
-    .pill.processing { border-color:#d97706; }
     .small { font-size: 12px; }
     .widewrap { overflow:auto; max-height: 520px; border:1px solid #eee; }
   </style>
@@ -71,7 +67,7 @@
 
     <button onclick="applyFilters()">Apply</button>
     <button onclick="clearFilters()">Clear</button>
-    <button onclick="downloadExcelFiltered()">Download Excel</button>
+    <button onclick="downloadExcel()">Download Excel</button>
   </div>
 
   <div id="listStatus" class="muted small"></div>
@@ -97,7 +93,11 @@
 let continuationToken = null;
 let currentJobPolling = null;
 
-// These are the columns YOU asked for (main list table)
+function apiBase() {
+  return "https://yavi-b4bahkdqced4ayhh.canadacentral-01.azurewebsites.net/api";
+}
+
+// Exact columns you requested (including Parts Worksheet preview fields)
 const COLS = [
   { key: "fileName", label: "File Name" },
   { key: "cevaInvoiceDate", label: "CEVA INVOICE DATE" },
@@ -111,16 +111,22 @@ const COLS = [
   { key: "duty", label: "DUTY" },
   { key: "supplier", label: "SUPPLIER" },
 
-  // Parts Worksheet summaries (joined strings)
-  { key: "partsInvoiceSeq", label: "PARTS Invoice_Seq" },
-  { key: "partsInvoiceNumber", label: "PARTS Invoice_Number" },
-  { key: "partsPartNo", label: "PARTS Part_No" },
-  { key: "partsHTS", label: "PARTS HTS_code" },
-  { key: "partsDescription", label: "PARTS Description_of_Goods" },
+  // Parts Worksheet (first line item preview in list)
+  { key: "parts_Invoice_Seq", label: "PARTS Invoice_Seq" },
+  { key: "parts_Invoice_Number", label: "PARTS Invoice_Number" },
+  { key: "parts_Part_No", label: "PARTS Part_No" },
+  { key: "parts_HTS_code", label: "PARTS HTS_code" },
+  { key: "parts_Description_of_Goods", label: "PARTS Description_of_Goods" },
 ];
 
-function apiBase() {
-  return "https://yavi-b4bahkdqced4ayhh.canadacentral-01.azurewebsites.net/api";
+function setHeaders() {
+  const tr = document.getElementById("resultsHeader");
+  tr.innerHTML = "";
+  COLS.forEach(c => {
+    const th = document.createElement("th");
+    th.textContent = c.label;
+    tr.appendChild(th);
+  });
 }
 
 function getFilters() {
@@ -134,23 +140,22 @@ function getFilters() {
 function buildResultsUrl(pageSize=20) {
   const { range, invoiceFrom, invoiceTo } = getFilters();
   let url = `${apiBase()}/results?pageSize=${pageSize}`;
-
   if (range && range !== "all") url += `&range=${encodeURIComponent(range)}`;
   if (invoiceFrom) url += `&invoiceFrom=${encodeURIComponent(invoiceFrom)}`;
   if (invoiceTo) url += `&invoiceTo=${encodeURIComponent(invoiceTo)}`;
-
   if (continuationToken) url += `&token=${encodeURIComponent(continuationToken)}`;
   return url;
 }
 
-function setHeaders() {
-  const tr = document.getElementById("resultsHeader");
-  tr.innerHTML = "";
-  COLS.forEach(c => {
-    const th = document.createElement("th");
-    th.textContent = c.label;
-    tr.appendChild(th);
-  });
+function downloadExcel() {
+  const { range, invoiceFrom, invoiceTo } = getFilters();
+  const params = [];
+  if (range && range !== "all") params.push(`range=${encodeURIComponent(range)}`);
+  if (invoiceFrom) params.push(`invoiceFrom=${encodeURIComponent(invoiceFrom)}`);
+  if (invoiceTo) params.push(`invoiceTo=${encodeURIComponent(invoiceTo)}`);
+
+  const url = `${apiBase()}/results/excel` + (params.length ? `?${params.join("&")}` : "");
+  window.location.href = url;
 }
 
 async function uploadFiles() {
@@ -183,8 +188,8 @@ async function uploadFiles() {
     const data = JSON.parse(text);
     const jobs = data.jobs || [];
 
-    statusEl.className = "ok";
     if (data.jobId) {
+      statusEl.className = "ok";
       statusEl.textContent = `Uploaded. Job ID: ${data.jobId}`;
       document.getElementById("jobIdInput").value = data.jobId;
       await refreshResults();
@@ -192,12 +197,15 @@ async function uploadFiles() {
       return;
     }
 
+    statusEl.className = "ok";
     statusEl.textContent = `Uploaded ZIP batch (${data.batchId}). Created ${jobs.length} job(s).`;
     await refreshResults();
+
     if (jobs.length) {
       document.getElementById("jobIdInput").value = jobs[0].jobId;
       loadJob(jobs[0].jobId);
     }
+
   } catch (e) {
     statusEl.className = "err";
     statusEl.textContent = "Connection error while uploading: " + e;
@@ -213,8 +221,6 @@ async function loadResults(reset=false) {
     continuationToken = null;
     document.getElementById("resultsTable").innerHTML = "";
   }
-
-  setHeaders();
 
   const url = buildResultsUrl(20);
   const res = await fetch(url);
@@ -241,7 +247,7 @@ async function loadResults(reset=false) {
   });
 
   if (!items.length && reset) {
-    listStatus.textContent = "No results for these filters. Try range=All or remove invoice date filters.";
+    listStatus.textContent = "No results for these filters.";
   } else {
     listStatus.textContent = `Loaded ${items.length} row(s).`;
   }
@@ -255,6 +261,7 @@ function loadMore() {
 }
 
 async function refreshResults() {
+  setHeaders();
   await loadResults(true);
 }
 
@@ -269,18 +276,6 @@ async function clearFilters() {
   document.getElementById("invoiceTo").value = "";
   continuationToken = null;
   await refreshResults();
-}
-
-function downloadExcelFiltered() {
-  const { range, invoiceFrom, invoiceTo } = getFilters();
-  const params = [];
-
-  if (range && range !== "all") params.push(`range=${encodeURIComponent(range)}`);
-  if (invoiceFrom) params.push(`invoiceFrom=${encodeURIComponent(invoiceFrom)}`);
-  if (invoiceTo) params.push(`invoiceTo=${encodeURIComponent(invoiceTo)}`);
-
-  const url = `${apiBase()}/results/excel` + (params.length ? `?${params.join("&")}` : "");
-  window.location.href = url;
 }
 
 async function loadJob(jobIdOverride) {
@@ -356,9 +351,16 @@ function renderPartsWorksheet(obj) {
   let html = `<div class="section"><h3>Parts Worksheet</h3>`;
   html += `<p><strong>Supplier:</strong> ${obj?.Supplier || ""}</p>`;
 
-  const lineItems = Array.isArray(obj?.LineItems) ? obj.LineItems : [];
+  let lineItems = obj?.LineItems;
 
-  if (lineItems.length > 0) {
+  // Backward-compat in case old docs still have wrapper
+  if (lineItems && lineItems.valueArray) {
+    // convert DI wrapper {valueArray:[{valueObject:{...}}]} into list of plain objects
+    const arr = lineItems.valueArray || [];
+    lineItems = arr.map(x => x.valueObject || x);
+  }
+
+  if (Array.isArray(lineItems) && lineItems.length > 0) {
     html += "<table><tr>";
     const headers = Object.keys(lineItems[0] || {});
     headers.forEach(h => html += `<th>${h}</th>`);
