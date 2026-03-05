@@ -55,7 +55,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 UPLOADS_CONTAINER      = os.environ.get("UPLOADS_CONTAINER", "uploads")
 COSMOS_DATABASE        = os.environ.get("COSMOS_DATABASE", "pdfbundle")
 COSMOS_CONTAINER       = os.environ.get("COSMOS_CONTAINER", "results")
-CLASSIFIER_ID          = os.environ.get("DI_CLASSIFIER_ID", "cevadocclassifier")
+CLASSIFIER_ID          = os.environ.get("DI_CLASSIFIER_ID", "cevadocmodel")
 ACTIVE_BATCH_DOC_ID    = "__active_batch__"   # Cosmos sentinel doc — never returned to callers
 
 TARGET_DOC_TYPES = ["CEVA", "ENTRY SUMMARY", "PARTS WORKSHEET"]
