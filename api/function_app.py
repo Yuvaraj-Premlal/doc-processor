@@ -5,54 +5,49 @@ import uuid
 import base64
 import io
 import zipfile
+import concurrent.futures
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, List, Tuple
 
 from azure.storage.blob import BlobServiceClient
 from azure.storage.queue import QueueClient
-
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-
 from azure.cosmos import CosmosClient
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
-
 from pypdf import PdfReader, PdfWriter
-
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
-# -------------------------
+
+# ============================================================
 # CONFIG
-# -------------------------
-UPLOADS_CONTAINER = os.environ.get("UPLOADS_CONTAINER", "uploads")
-
-COSMOS_DATABASE = os.environ.get("COSMOS_DATABASE", "pdfbundle")
-COSMOS_CONTAINER = os.environ.get("COSMOS_CONTAINER", "results")
-
-CLASSIFIER_ID = os.environ.get("DI_CLASSIFIER_ID", "cevadocclassmodel")
+# ============================================================
+UPLOADS_CONTAINER       = os.environ.get("UPLOADS_CONTAINER", "uploads")
+COSMOS_DATABASE         = os.environ.get("COSMOS_DATABASE", "pdfbundle")
+COSMOS_CONTAINER        = os.environ.get("COSMOS_CONTAINER", "results")
+CLASSIFIER_ID           = os.environ.get("DI_CLASSIFIER_ID", "cevadocclassmodel")
+ACTIVE_BATCH_RECORD_ID  = "active_batch"
 
 TARGET_DOC_TYPES = ["CEVA", "ENTRY SUMMARY", "PARTS WORKSHEET"]
 
 EXTRACTION_MODELS = {
-    "CEVA": "ceva_invoice_model",
-    "ENTRY SUMMARY": "entry-summary-v1",
-    "PARTS WORKSHEET": "partsworksheet_model",
+    "CEVA":             "ceva_invoice_model",
+    "ENTRY SUMMARY":    "entry-summary-v1",
+    "PARTS WORKSHEET":  "partsworksheet_model",
 }
 
-ROTATION_FALLBACK_DEGREES = -90
-
-DEFAULT_PAGE_SIZE = 20
-MAX_PAGE_SIZE = 200
-
+DEFAULT_PAGE_SIZE       = 20
+MAX_PAGE_SIZE           = 200
 CEVA_INVOICE_DATE_FIELD = "INVOICE DATE"
 
-# -------------------------
+
+# ============================================================
 # TIME HELPERS
-# -------------------------
+# ============================================================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -60,9 +55,11 @@ def utc_now_iso() -> str:
     return utc_now().isoformat()
 
 
-# -------------------------
+# ============================================================
 # CLIENT HELPERS
-# -------------------------
+# All clients are created fresh per-call (Azure Functions best practice).
+# Heavy calls (DI extractions) reuse a single client instance passed in.
+# ============================================================
 def blob_service() -> BlobServiceClient:
     return BlobServiceClient.from_connection_string(os.environ["AzureWebJobsStorage"])
 
@@ -86,9 +83,9 @@ def cosmos_container():
     return db.get_container_client(COSMOS_CONTAINER)
 
 
-# -------------------------
+# ============================================================
 # SMALL UTILS
-# -------------------------
+# ============================================================
 def normalize_doctype(s: Optional[str]) -> str:
     return (s or "").strip().upper()
 
@@ -100,26 +97,6 @@ def _is_pdf_filename(name: str) -> bool:
 
 def _is_zip_filename(name: str) -> bool:
     return (name or "").lower().endswith(".zip")
-
-def delete_prefix(container_client, prefix: str):
-    for blob in container_client.list_blobs(name_starts_with=prefix):
-        container_client.delete_blob(blob.name)
-
-def rotate_pdf_bytes(pdf_bytes: bytes, degrees: int) -> bytes:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    writer = PdfWriter()
-    deg = degrees % 360
-    for p in reader.pages:
-        if deg == 90:
-            p.rotate_clockwise(90)
-        elif deg == 180:
-            p.rotate_clockwise(180)
-        elif deg == 270:
-            p.rotate_clockwise(270)
-        writer.add_page(p)
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue()
 
 def _parse_int(s: Optional[str], default: int) -> int:
     try:
@@ -135,10 +112,14 @@ def _parse_iso_date_only(s: Optional[str]) -> Optional[str]:
         return s[:10]
     return None
 
+def delete_prefix(container_client, prefix: str):
+    for blob in container_client.list_blobs(name_starts_with=prefix):
+        container_client.delete_blob(blob.name)
 
-# -------------------------
+
+# ============================================================
 # DI VALUE NORMALIZATION
-# -------------------------
+# ============================================================
 def _jsonable(obj):
     if obj is None:
         return None
@@ -159,9 +140,9 @@ def _jsonable(obj):
                 pass
     d = getattr(obj, "__dict__", None)
     if isinstance(d, dict) and d:
-        # FIX: was `for v in d.items()` (bug — iterated tuples, ignored keys)
         return {k: _jsonable(v) for k, v in d.items()}
     return str(obj)
+
 
 def _normalize_di_wrapped_value(v: Any) -> Any:
     if v is None:
@@ -171,34 +152,19 @@ def _normalize_di_wrapped_value(v: Any) -> Any:
     if isinstance(v, list):
         return [_normalize_di_wrapped_value(x) for x in v]
     if isinstance(v, dict):
-        if "valueString" in v:
-            return v.get("valueString")
-        if "valueNumber" in v:
-            return v.get("valueNumber")
-        if "valueInteger" in v:
-            return v.get("valueInteger")
-        if "valueBoolean" in v:
-            return v.get("valueBoolean")
-        if "valueDate" in v:
-            return v.get("valueDate")
-        if "valueTime" in v:
-            return v.get("valueTime")
-        if "valuePhoneNumber" in v:
-            return v.get("valuePhoneNumber")
-        if "valueSelectionMark" in v:
-            return v.get("valueSelectionMark")
+        for key in ("valueString", "valueNumber", "valueInteger", "valueBoolean",
+                    "valueDate", "valueTime", "valuePhoneNumber", "valueSelectionMark"):
+            if key in v:
+                return v[key]
         if "valueObject" in v and isinstance(v["valueObject"], dict):
             return {k: _normalize_di_wrapped_value(val) for k, val in v["valueObject"].items()}
         if "valueArray" in v and isinstance(v["valueArray"], list):
             return [_normalize_di_wrapped_value(item) for item in v["valueArray"]]
         drop = {"boundingRegions", "polygon", "spans"}
-        clean = {}
-        for k, val in v.items():
-            if k in drop or k == "content":
-                continue
-            clean[k] = _normalize_di_wrapped_value(val)
-        return clean
+        return {k: _normalize_di_wrapped_value(val) for k, val in v.items()
+                if k not in drop and k != "content"}
     return _normalize_di_wrapped_value(_jsonable(v))
+
 
 def _field_value_simple(field):
     if field is None:
@@ -211,40 +177,20 @@ def _field_value_simple(field):
         return content
     return _normalize_di_wrapped_value(_jsonable(field))
 
-def simplify_analyze_result(result):
+
+def simplify_analyze_result(result) -> dict:
     docs = getattr(result, "documents", None) or []
     if not docs:
         return {"fields": {}, "hasData": False}
     fields = getattr(docs[0], "fields", None) or {}
-    simple = {}
-    for k, v in fields.items():
-        simple[str(k)] = _field_value_simple(v)
+    simple = {str(k): _field_value_simple(v) for k, v in fields.items()}
     has_data = any(v not in (None, "", [], {}) for v in simple.values())
     return {"fields": simple, "hasData": has_data}
 
 
-# -------------------------
-# PARTS WORKSHEET LINE ITEMS — NORMALIZATION
-#
-# _unwrap_line_item_field handles ALL DI field value forms:
-#   1. Standard typed:   {"type":"string","valueString":"SEQ 1",...}  => "SEQ 1"
-#   2. Content-only:     {"type":"string","content":"SEQ 1"}          => "SEQ 1"
-#      (DI omits valueString on low-confidence / rotated page fields)
-#   3. Nested objects / arrays
-#   4. Already plain str/int/float
-#   5. Absolute fallback: str(v) — prevents [object Object] in JS
-#
-# _fix_parts_worksheet_line_items handles LineItems in all storage forms:
-#   Case A — Clean list (new uploads after fix)
-#   Case B — DI wrapper: {"type":"array","valueArray":[{"type":"object","valueObject":{...}}]}
-#   Case C — Missing / None
-#
-# _dedup_spacejoined handles fields where DI concatenates repeated OCR spans:
-#   "4965482 4965482"            => "4965482"
-#   "COOLER CORE COOLER CORE"   => "COOLER CORE"
-#   "4965482 4965483"           => "4965482, 4965483"  (distinct => join with ", ")
-# -------------------------
-
+# ============================================================
+# PARTS WORKSHEET — LINE ITEM NORMALIZATION
+# ============================================================
 def _unwrap_line_item_field(fv: Any) -> Any:
     """Fully unwrap a single DI field value to a plain scalar or structure."""
     if fv is None:
@@ -254,76 +200,53 @@ def _unwrap_line_item_field(fv: Any) -> Any:
     if isinstance(fv, list):
         return [_unwrap_line_item_field(i) for i in fv]
     if isinstance(fv, dict):
-        # Typed scalar wrappers — priority order
         for key in ("valueString", "valueNumber", "valueInteger", "valueDate",
                     "valueTime", "valueBoolean", "valuePhoneNumber", "valueSelectionMark"):
             if key in fv:
                 val = fv[key]
                 return _unwrap_line_item_field(val) if isinstance(val, dict) else val
-
-        # Nested object wrapper
         if "valueObject" in fv and isinstance(fv["valueObject"], dict):
             return {k: _unwrap_line_item_field(v) for k, v in fv["valueObject"].items()}
-
-        # Array wrapper
         if "valueArray" in fv and isinstance(fv["valueArray"], list):
             return [_unwrap_line_item_field(i) for i in fv["valueArray"]]
-
-        # CRITICAL: content-only fallback — DI sometimes returns a field with
-        # `content` but NO valueString (low-confidence / rotated pages).
-        # Without this branch, the whole dict leaks through and JS shows [object Object].
+        # content-only fallback — DI omits valueString on low-confidence / rotated pages
         if "content" in fv:
             return str(fv["content"])
-
-        # Plain dict with no DI keys — recursively clean values
-        # return {k: _unwrap_line_item_field(v) for k, v in fv.items()}
-    # Plain dict with no extractable DI value — return None rather than
-        # leaking metadata dict (type/confidence only, no actual text)
+        # No extractable DI value — return None to avoid leaking metadata dicts
         return None
-
-    # Absolute last resort — ensures JS never sees a raw object
     return str(fv)
 
 
 def _dedup_spacejoined(s: str) -> str:
     """
-    DI sometimes returns a single string where the same value appears twice,
-    space-joined, when it spans multiple OCR regions on the page.
-    e.g. "4965482 4965482" => "4965482"
-         "COOLER CORE COOLER CORE" => "COOLER CORE"
-         "4965482 4965483" => "4965482, 4965483"  (distinct values joined)
-
-    Strategy: only deduplicate when we can confirm EXACT repetition (half-split).
-    Does not mangle legitimate multi-word strings like "FUEL COMPONENT OF DIESEL ENGINE".
+    DI sometimes returns 'VALUE VALUE' when a field spans multiple OCR regions.
+    Deduplicates exact half-repetitions only — never mangles legitimate strings.
+    e.g. 'COOLER CORE COOLER CORE' => 'COOLER CORE'
+         '4965482 4965483'         => '4965482, 4965483'  (distinct => join)
     """
     s = s.strip()
     if not s:
         return s
-
     tokens = s.split(" ")
     n = len(tokens)
-
-    # All tokens identical (e.g. "SEQ SEQ")
     unique = list(dict.fromkeys(tokens))
     if len(unique) == 1:
         return unique[0]
-
-    # Even-length exact half-repetition (e.g. "COOLER CORE COOLER CORE")
     if n >= 2 and n % 2 == 0:
         half = n // 2
-        first_half = " ".join(tokens[:half])
+        first_half  = " ".join(tokens[:half])
         second_half = " ".join(tokens[half:])
         if first_half == second_half:
             return first_half
-
     return s
 
 
 def _fix_parts_worksheet_line_items(pw_fields: dict) -> dict:
     """
     Ensures parts_worksheet.LineItems is a clean plain list of dicts.
-    Handles all storage cases (new clean list, old DI wrapper, missing).
-    Also applies _dedup_spacejoined to all string field values.
+    Handles all storage cases: new clean list, old DI wrapper, missing.
+    Applies _dedup_spacejoined to all string field values.
+    Safe to call on both freshly extracted and old Cosmos documents.
     """
     if not isinstance(pw_fields, dict):
         return pw_fields
@@ -332,17 +255,14 @@ def _fix_parts_worksheet_line_items(pw_fields: dict) -> dict:
     raw_items: List[Any] = []
 
     if isinstance(line_items, list):
-        # Case A: already a list — may still need field-level unwrapping
         raw_items = line_items
     elif isinstance(line_items, dict) and "valueArray" in line_items:
-        # Case B: top-level DI array wrapper
         for item in (line_items.get("valueArray") or []):
             if not isinstance(item, dict):
                 continue
             vo = item.get("valueObject", {})
             raw_items.append(vo if isinstance(vo, dict) else item)
     else:
-        # Case C: missing / None / unexpected
         pw_fields["LineItems"] = []
         return pw_fields
 
@@ -353,7 +273,6 @@ def _fix_parts_worksheet_line_items(pw_fields: dict) -> dict:
         row = {}
         for field_name, field_val in item.items():
             unwrapped = _unwrap_line_item_field(field_val)
-            # Deduplicate space-joined repeated values from DI multi-span extraction
             if isinstance(unwrapped, str):
                 unwrapped = _dedup_spacejoined(unwrapped)
             row[field_name] = unwrapped
@@ -363,9 +282,9 @@ def _fix_parts_worksheet_line_items(pw_fields: dict) -> dict:
     return pw_fields
 
 
-# -------------------------
+# ============================================================
 # PDF HELPERS
-# -------------------------
+# ============================================================
 def split_pdf_to_single_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     out = []
@@ -378,47 +297,53 @@ def split_pdf_to_single_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     return out
 
 
-# -------------------------
+def extract_pages(reader: PdfReader, page_numbers: List[int]) -> bytes:
+    """
+    Extract specific pages from an already-parsed PdfReader.
+    Caller should parse PDF bytes once and reuse the reader.
+    """
+    writer = PdfWriter()
+    for p in page_numbers:
+        writer.add_page(reader.pages[p - 1])
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+# ============================================================
 # INVOICE DATE PARSING / NORMALIZATION
-# -------------------------
+# ============================================================
 def _try_parse_date_to_yyyy_mm_dd(value: Any) -> Optional[str]:
     if value is None:
         return None
     s = str(value).strip()
     if not s:
         return None
+    # Already ISO
     if len(s) >= 10 and s[4] == "-" and s[7] == "-":
         return s[:10]
     s2 = s.replace(".", "/").replace("-", "/")
     parts = [p.strip() for p in s2.split("/") if p.strip()]
+    # YYYY/MM/DD
     if len(parts) == 3 and len(parts[0]) == 4 and parts[0].isdigit():
         y, m, d = parts[0], parts[1].zfill(2), parts[2].zfill(2)
         if m.isdigit() and d.isdigit():
             return f"{y}-{m}-{d}"
+    # DD/MM/YYYY or MM/DD/YYYY
     if len(parts) == 3 and len(parts[2]) == 4 and parts[2].isdigit():
         a, b, y = parts[0], parts[1], parts[2]
         if a.isdigit() and b.isdigit():
             da, db = int(a), int(b)
-            if da > 12:
-                d, m = da, db
-            elif db > 12:
-                m, d = da, db
-            else:
-                d, m = da, db
+            d, m = (da, db) if da > 12 else (db, da) if db > 12 else (da, db)
             return f"{y}-{str(m).zfill(2)}-{str(d).zfill(2)}"
-    try:
-        t = s.replace("-", " ").replace("/", " ")
-        dt = datetime.strptime(t.strip(), "%d %b %Y")
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
-    try:
-        t = s.replace("-", " ").replace("/", " ")
-        dt = datetime.strptime(t.strip(), "%d %B %Y")
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
+    for fmt in ("%d %b %Y", "%d %B %Y"):
+        try:
+            t = s.replace("-", " ").replace("/", " ").strip()
+            return datetime.strptime(t, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
     return None
+
 
 def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
     ceva = doc.get("ceva") if isinstance(doc.get("ceva"), dict) else {}
@@ -434,6 +359,7 @@ def _extract_ceva_invoice_date(doc: dict) -> Optional[str]:
                 return parsed
     return None
 
+
 def _compute_range(range_key: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     if not range_key:
         return (None, None)
@@ -448,16 +374,16 @@ def _compute_range(range_key: Optional[str]) -> Tuple[Optional[str], Optional[st
         start = today - timedelta(days=30)
         return (start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"))
     if rk == "last_month":
-        first_this_month = today.replace(day=1)
-        last_prev_month = first_this_month - timedelta(days=1)
-        first_prev_month = last_prev_month.replace(day=1)
+        first_this_month  = today.replace(day=1)
+        last_prev_month   = first_this_month - timedelta(days=1)
+        first_prev_month  = last_prev_month.replace(day=1)
         return (first_prev_month.strftime("%Y-%m-%d"), last_prev_month.strftime("%Y-%m-%d"))
     return (None, None)
 
 
-# -------------------------
+# ============================================================
 # SUMMARY COLUMNS
-# -------------------------
+# ============================================================
 SUMMARY_COLS = [
     ("fileName",                   "File Name"),
     ("cevaInvoiceDate",            "CEVA INVOICE DATE"),
@@ -491,8 +417,7 @@ def _safe_to_cell(v: Any) -> Any:
 def _join_all_line_item_values(line_items: List[dict], field: str) -> str:
     """
     Collect `field` from every line item and join distinct non-empty values
-    with ", ". Used so all parts are visible in summary columns, not just row 0.
-    e.g. ["6492804", "6492806", "6585584"] => "6492804, 6492806, 6585584"
+    with ', '. Shows all parts in summary columns, not just the first row.
     """
     seen = []
     for item in (line_items or []):
@@ -505,9 +430,46 @@ def _join_all_line_item_values(line_items: List[dict], field: str) -> str:
     return ", ".join(seen)
 
 
-# -------------------------
+# ============================================================
+# BATCH MANAGEMENT — clear stale queue jobs
+# ============================================================
+def _set_active_batch(batch_id: str) -> None:
+    """Write the current batch ID to Cosmos so workers can check staleness."""
+    cosmos_container().upsert_item({
+        "id":      ACTIVE_BATCH_RECORD_ID,
+        "type":    ACTIVE_BATCH_RECORD_ID,
+        "batchId": batch_id,
+    })
+
+
+def _get_active_batch_id() -> Optional[str]:
+    try:
+        doc = cosmos_container().read_item(
+            item=ACTIVE_BATCH_RECORD_ID,
+            partition_key=ACTIVE_BATCH_RECORD_ID,
+        )
+        return doc.get("batchId")
+    except CosmosResourceNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _clear_queue_safe(qc: QueueClient) -> None:
+    """
+    Delete all pending (visible) messages from the queue.
+    Messages already dequeued by a worker are invisible and won't be cleared here —
+    those are handled by the batchId staleness check in job_worker.
+    """
+    try:
+        qc.clear_messages()
+    except Exception:
+        pass  # Queue may already be empty — safe to ignore
+
+
+# ============================================================
 # HTTP: UPLOAD (PDF + ZIP)
-# -------------------------
+# ============================================================
 @app.route(route="upload", methods=["POST"])
 def upload(req: func.HttpRequest) -> func.HttpResponse:
     files = req.files.getlist("files")
@@ -525,15 +487,37 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         pass
 
     qc = queue_client()
+
+    # ----------------------------------------------------------
+    # ✅ STEP 1: Clear pending queue messages from previous runs
+    # ----------------------------------------------------------
+    _clear_queue_safe(qc)
+
+    # ----------------------------------------------------------
+    # ✅ STEP 2: Register new batch ID in Cosmos.
+    # Workers dequeued before the clear will check this and self-discard.
+    # ----------------------------------------------------------
     batch_id = str(uuid.uuid4())
+    _set_active_batch(batch_id)
+
     jobs = []
 
     def enqueue_one_pdf(pdf_bytes: bytes, filename: str) -> dict:
-        job_id = str(uuid.uuid4())
+        job_id    = str(uuid.uuid4())
         blob_path = f"{job_id}/original/{filename}"
         uploads.upload_blob(blob_path, pdf_bytes, overwrite=True)
-        qc.send_message(json.dumps({"jobId": job_id, "pdfBlobPath": blob_path, "fileName": filename}))
-        return {"jobId": job_id, "fileName": filename, "blobPath": blob_path, "bytes": len(pdf_bytes)}
+        qc.send_message(json.dumps({
+            "jobId":       job_id,
+            "pdfBlobPath": blob_path,
+            "fileName":    filename,
+            "batchId":     batch_id,   # ✅ stamp every message with current batch
+        }))
+        return {
+            "jobId":    job_id,
+            "fileName": filename,
+            "blobPath": blob_path,
+            "bytes":    len(pdf_bytes),
+        }
 
     try:
         for f in files:
@@ -556,7 +540,7 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
                 jobs.append(enqueue_one_pdf(data, filename))
             else:
                 return func.HttpResponse(
-                    json.dumps({"error": f"Unsupported file type: {filename}. Upload PDF or ZIP containing PDFs."}),
+                    json.dumps({"error": f"Unsupported file type: {filename}. Upload PDF or ZIP of PDFs."}),
                     status_code=400, mimetype="application/json",
                 )
 
@@ -566,225 +550,257 @@ def upload(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(json.dumps(resp), status_code=200, mimetype="application/json")
 
     except zipfile.BadZipFile:
-        return func.HttpResponse(json.dumps({"error": "Invalid ZIP file."}), status_code=400, mimetype="application/json")
+        return func.HttpResponse(
+            json.dumps({"error": "Invalid ZIP file."}),
+            status_code=400, mimetype="application/json",
+        )
     except Exception as e:
-        return func.HttpResponse(json.dumps({"error": str(e)}), status_code=500, mimetype="application/json")
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            status_code=500, mimetype="application/json",
+        )
 
 
-# -------------------------
+# ============================================================
 # QUEUE WORKER
-# -------------------------
+# ============================================================
 @app.function_name(name="job_worker")
 @app.queue_trigger(arg_name="msg", queue_name="jobs", connection="AzureWebJobsStorage")
 def job_worker(msg: func.QueueMessage) -> None:
-    payload = json.loads(msg.get_body().decode("utf-8"))
-    job_id = payload.get("jobId")
+    payload       = json.loads(msg.get_body().decode("utf-8"))
+    job_id        = payload.get("jobId")
     pdf_blob_path = payload.get("pdfBlobPath")
-    file_name = payload.get("fileName")
+    file_name     = payload.get("fileName")
+    msg_batch_id  = payload.get("batchId")
 
-    container = cosmos_container()
-    uploads = blob_service().get_container_client(UPLOADS_CONTAINER)
-    created_at = utc_now_iso()
+    uploads_client = blob_service().get_container_client(UPLOADS_CONTAINER)
+    container      = cosmos_container()
+    created_at     = utc_now_iso()
+
+    # ----------------------------------------------------------
+    # ✅ STALENESS CHECK — discard jobs from superseded batches.
+    # Covers the race condition where clear_messages() was called
+    # but this message was already invisible (dequeued by runtime).
+    # ----------------------------------------------------------
+    active_batch_id = _get_active_batch_id()
+    if msg_batch_id and active_batch_id and msg_batch_id != active_batch_id:
+        # Clean up orphaned blob and exit silently
+        try:
+            uploads_client.delete_blob(pdf_blob_path)
+        except Exception:
+            pass
+        return
 
     try:
         container.upsert_item({
-            "id": job_id,
-            "type": "bundle_result",
-            "fileName": file_name,
+            "id":        job_id,
+            "type":      "bundle_result",
+            "fileName":  file_name,
             "createdAt": created_at,
-            "status": "processing",
+            "status":    "processing",
         })
 
-        pdf_bytes = uploads.get_blob_client(pdf_blob_path).download_blob().readall()
-        client = di_client()
+        pdf_bytes = uploads_client.get_blob_client(pdf_blob_path).download_blob().readall()
 
-        # -------------------------------------------------------
-        # 1️⃣ Classify ENTIRE PDF once
-        # -------------------------------------------------------
-        poller = client.begin_classify_document(
+        # Create a single DI client and PDF reader — reused across all calls
+        client = di_client()
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+
+        # ------------------------------------------------------
+        # 1️⃣ Classify entire PDF once (sequential — required first)
+        # ------------------------------------------------------
+        poller               = client.begin_classify_document(
             CLASSIFIER_ID,
             body=pdf_bytes,
             content_type="application/pdf",
         )
-
         classification_result = poller.result()
 
-        best_docs = {}
-
+        best_docs: Dict[str, Dict] = {}
         for doc in classification_result.documents:
-            doc_type = normalize_doctype(doc.doc_type)
+            doc_type   = normalize_doctype(doc.doc_type)
             confidence = doc.confidence
-
-            pages = [r.page_number for r in doc.bounding_regions]
-
+            pages      = [r.page_number for r in doc.bounding_regions]
             if doc_type in TARGET_DOC_TYPES:
                 existing = best_docs.get(doc_type)
-
                 if not existing or confidence > existing["confidence"]:
-                    best_docs[doc_type] = {
-                        "confidence": confidence,
-                        "pages": pages
-                    }
+                    best_docs[doc_type] = {"confidence": confidence, "pages": pages}
 
-        # -------------------------------------------------------
-        # Helper to extract specific pages
-        # -------------------------------------------------------
-        def extract_pages(pdf_bytes: bytes, page_numbers: list[int]) -> bytes:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            writer = PdfWriter()
-
-            for p in page_numbers:
-                writer.add_page(reader.pages[p - 1])
-
-            buf = io.BytesIO()
-            writer.write(buf)
-            return buf.getvalue()
-
-        # -------------------------------------------------------
-        # 2️⃣ Run extraction models
-        # -------------------------------------------------------
-        merged = {}
-        picked_pages = {}
-        confidence = {}
-        extracted_docs = []
-
-        for doc_type, info in best_docs.items():
-
+        # ------------------------------------------------------
+        # 2️⃣ Run all extraction models IN PARALLEL
+        # ------------------------------------------------------
+        def extract_one(doc_type: str, info: dict) -> Optional[dict]:
+            """
+            Runs one extraction model and returns a result dict.
+            Executed concurrently in a thread pool — each call gets
+            its own DI client instance to avoid shared-state issues.
+            """
             model_id = EXTRACTION_MODELS.get(doc_type)
             if not model_id:
-                continue
+                return None
 
-            extracted_pdf = extract_pages(pdf_bytes, info["pages"])
+            extracted_pdf = extract_pages(reader, info["pages"])
 
-            poller = client.begin_analyze_document(
+            # Each thread creates its own DI client (not thread-safe to share)
+            thread_client = di_client()
+            poller        = thread_client.begin_analyze_document(
                 model_id,
                 body=extracted_pdf,
-                content_type="application/pdf"
+                content_type="application/pdf",
             )
-
             analyze_result = poller.result()
-
-            simplified = simplify_analyze_result(analyze_result)
-
-            fields = simplified.get("fields", {})
+            simplified     = simplify_analyze_result(analyze_result)
+            fields         = simplified.get("fields", {})
 
             key = safe_slug(doc_type).lower()
-
             if key == "parts_worksheet":
                 fields = _fix_parts_worksheet_line_items(fields)
 
-            merged[key] = fields
+            return {
+                "doc_type":   doc_type,
+                "key":        key,
+                "model_id":   model_id,
+                "pages":      info["pages"],
+                "confidence": info["confidence"],
+                "fields":     fields,
+            }
 
-            picked_pages[doc_type] = info["pages"]
+        merged       = {}
+        picked_pages = {}
+        confidence   = {}
+        extracted_docs = []
 
-            confidence[doc_type] = info["confidence"]
+        # ThreadPoolExecutor — ideal for I/O-bound DI HTTP calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(best_docs) or 1) as executor:
+            future_map = {
+                executor.submit(extract_one, doc_type, info): doc_type
+                for doc_type, info in best_docs.items()
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                result = future.result()
+                if result is None:
+                    continue
+                merged[result["key"]]              = result["fields"]
+                picked_pages[result["doc_type"]]   = result["pages"]
+                confidence[result["doc_type"]]     = result["confidence"]
+                extracted_docs.append({
+                    "docType":    result["doc_type"],
+                    "modelId":    result["model_id"],
+                    "pages":      result["pages"],
+                    "fieldCount": len(result["fields"]),
+                })
 
-            extracted_docs.append({
-                "docType": doc_type,
-                "modelId": model_id,
-                "pages": info["pages"],
-                "fieldCount": len(fields)
-            })
-
-        # -------------------------------------------------------
-        # 3️⃣ Save final document
-        # -------------------------------------------------------
+        # ------------------------------------------------------
+        # 3️⃣ Save completed result to Cosmos
+        # ------------------------------------------------------
         final_doc = {
-            "id": job_id,
-            "type": "bundle_result",
-            "fileName": file_name,
-            "createdAt": created_at,
-            "completedAt": utc_now_iso(),
-            "status": "completed",
+            "id":                job_id,
+            "type":              "bundle_result",
+            "fileName":          file_name,
+            "createdAt":         created_at,
+            "completedAt":       utc_now_iso(),
+            "status":            "completed",
             "sourcePdfBlobPath": pdf_blob_path,
-            "pickedPages": picked_pages,
-            "confidence": confidence,
-            "extractedDocs": extracted_docs,
+            "pickedPages":       picked_pages,
+            "confidence":        confidence,
+            "extractedDocs":     extracted_docs,
             **merged,
         }
-
         final_doc["cevaInvoiceDate"] = _extract_ceva_invoice_date(final_doc)
 
         container.upsert_item(final_doc)
 
-        delete_prefix(uploads, f"{job_id}/")
+        # Clean up uploaded blob after successful processing
+        delete_prefix(uploads_client, f"{job_id}/")
 
     except Exception as e:
+        # Record failure — blob intentionally left for debugging
         container.upsert_item({
-            "id": job_id or str(uuid.uuid4()),
-            "type": "bundle_result",
-            "fileName": file_name,
-            "createdAt": created_at,
-            "status": "failed",
-            "error": str(e),
-            "failedAt": utc_now_iso(),
+            "id":                job_id or str(uuid.uuid4()),
+            "type":              "bundle_result",
+            "fileName":          file_name,
+            "createdAt":         created_at,
+            "status":            "failed",
+            "error":             str(e),
+            "failedAt":          utc_now_iso(),
             "sourcePdfBlobPath": pdf_blob_path,
         })
         raise
 
-# -------------------------
-# HTTP: JOB UI (UI-READY)
-# -------------------------
+
+# ============================================================
+# HTTP: JOB DETAIL (UI-READY)
+# ============================================================
 @app.route(route="job/{jobId}/ui", methods=["GET"])
 def get_job_ui(req: func.HttpRequest) -> func.HttpResponse:
     job_id = req.route_params.get("jobId")
     if not job_id:
-        return func.HttpResponse(json.dumps({"error": "Missing jobId"}), status_code=400, mimetype="application/json")
+        return func.HttpResponse(
+            json.dumps({"error": "Missing jobId"}),
+            status_code=400, mimetype="application/json",
+        )
 
     container = cosmos_container()
     try:
         doc = container.read_item(item=job_id, partition_key=job_id)
     except CosmosResourceNotFoundError:
-        return func.HttpResponse(json.dumps({"id": job_id, "status": "not_found"}), status_code=404, mimetype="application/json")
+        return func.HttpResponse(
+            json.dumps({"id": job_id, "status": "not_found"}),
+            status_code=404, mimetype="application/json",
+        )
 
     status = doc.get("status")
+
     if status in ("processing", "failed"):
         out = {"id": job_id, "status": status}
         if status == "processing":
             out["createdAt"] = doc.get("createdAt")
         if status == "failed":
-            out["error"] = doc.get("error")
+            out["error"]    = doc.get("error")
             out["failedAt"] = doc.get("failedAt")
-        return func.HttpResponse(json.dumps(out, default=str), status_code=200, mimetype="application/json")
+        return func.HttpResponse(
+            json.dumps(out, default=str),
+            status_code=200, mimetype="application/json",
+        )
 
     def strip_internal(d: dict) -> dict:
-        if not isinstance(d, dict):
-            return d
-        return {k: v for k, v in d.items() if not k.startswith("_")}
+        return {k: v for k, v in d.items() if not k.startswith("_")} if isinstance(d, dict) else d
 
-    # Apply fix when serving old Cosmos docs so the detail view also renders
-    # correctly without needing reprocessing.
-    pw_raw = strip_internal(doc.get("parts_worksheet") or {})
+    # Fix wrapped LineItems on old Cosmos docs — no reprocessing required
+    pw_raw   = strip_internal(doc.get("parts_worksheet") or {})
     pw_fixed = _fix_parts_worksheet_line_items(pw_raw)
 
     out = {
-        "id": doc.get("id"),
-        "fileName": doc.get("fileName"),
-        "status": doc.get("status"),
-        "createdAt": doc.get("createdAt"),
-        "completedAt": doc.get("completedAt"),
+        "id":              doc.get("id"),
+        "fileName":        doc.get("fileName"),
+        "status":          doc.get("status"),
+        "createdAt":       doc.get("createdAt"),
+        "completedAt":     doc.get("completedAt"),
         "cevaInvoiceDate": doc.get("cevaInvoiceDate"),
-        "ceva": strip_internal(doc.get("ceva") or {}),
-        "entry_summary": strip_internal(doc.get("entry_summary") or {}),
+        "ceva":            strip_internal(doc.get("ceva") or {}),
+        "entry_summary":   strip_internal(doc.get("entry_summary") or {}),
         "parts_worksheet": pw_fixed,
     }
-    return func.HttpResponse(json.dumps(out, default=str), status_code=200, mimetype="application/json")
+    return func.HttpResponse(
+        json.dumps(out, default=str),
+        status_code=200, mimetype="application/json",
+    )
 
 
-# -------------------------
-# COSMOS QUERIES (LIST + EXCEL)
-# -------------------------
+# ============================================================
+# COSMOS QUERY BUILDER (shared by list + excel)
+# ============================================================
 def _build_filters_from_req(req: func.HttpRequest):
-    q = req.params.get("q")
-    range_key = req.params.get("range")
+    q           = req.params.get("q")
+    range_key   = req.params.get("range")
     invoice_from = _parse_iso_date_only(req.params.get("invoiceFrom"))
-    invoice_to = _parse_iso_date_only(req.params.get("invoiceTo"))
+    invoice_to   = _parse_iso_date_only(req.params.get("invoiceTo"))
 
-    if range_key and (not invoice_from and not invoice_to) and range_key.strip().lower() != "all":
+    if range_key and not (invoice_from or invoice_to) and range_key.strip().lower() != "all":
         rf, rt = _compute_range(range_key)
         invoice_from, invoice_to = rf, rt
 
-    where = ['c.type = "bundle_result"', 'c.status = "completed"']
+    where  = ['c.type = "bundle_result"', 'c.status = "completed"']
     params = []
 
     if q:
@@ -800,38 +816,37 @@ def _build_filters_from_req(req: func.HttpRequest):
     return " AND ".join(where), params
 
 
-# -------------------------
+# ============================================================
 # HTTP: RESULTS LIST (PAGINATED)
-# Returns full LineItems array from Cosmos, then post-processes server-side:
-#   - fixes any wrapped LineItems (old docs)
-#   - builds comma-joined summary columns across ALL line items (not just [0])
-# -------------------------
+# Fetches full LineItems from Cosmos, post-processes server-side:
+#   - fixes wrapped LineItems (old docs)
+#   - builds comma-joined summary columns across ALL line items
+# ============================================================
 @app.route(route="results", methods=["GET"])
 def list_results(req: func.HttpRequest) -> func.HttpResponse:
     container = cosmos_container()
 
     page_size = _parse_int(req.params.get("pageSize"), DEFAULT_PAGE_SIZE)
     page_size = max(1, min(MAX_PAGE_SIZE, page_size))
-    token = req.params.get("token")
+    token     = req.params.get("token")
 
     where_clause, params = _build_filters_from_req(req)
 
-    # Pull full LineItems array so we can join all values, not just [0]
     query = f"""
     SELECT
       c.id,
       c.fileName,
       c.cevaInvoiceDate,
-      c.ceva["INVOICE NUMBER"] AS invoiceNumber,
-      c.ceva["ENTRY NUMBER"] AS entryNumber,
-      c.ceva["DEPARTURE DATE"] AS departureDate,
-      c.ceva["ARRIVAL DATE"] AS arrivalDate,
+      c.ceva["INVOICE NUMBER"]      AS invoiceNumber,
+      c.ceva["ENTRY NUMBER"]        AS entryNumber,
+      c.ceva["DEPARTURE DATE"]      AS departureDate,
+      c.ceva["ARRIVAL DATE"]        AS arrivalDate,
       c.ceva["DESCRIPTION OF GOODS"] AS descriptionOfGoods,
       c.entry_summary.Total_Entered_Value AS totalEnteredValue,
-      c.entry_summary.Total_Other_Fees AS totalOtherFees,
-      c.entry_summary.Duty AS duty,
-      c.parts_worksheet.Supplier AS supplier,
-      c.parts_worksheet.LineItems AS lineItems
+      c.entry_summary.Total_Other_Fees    AS totalOtherFees,
+      c.entry_summary.Duty                AS duty,
+      c.parts_worksheet.Supplier          AS supplier,
+      c.parts_worksheet.LineItems         AS lineItems
     FROM c
     WHERE {where_clause}
     ORDER BY c.cevaInvoiceDate DESC
@@ -844,16 +859,15 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
             enable_cross_partition_query=True,
             max_item_count=page_size,
         )
-        page_iter = items_iterable.by_page(continuation_token=token)
-        page = next(page_iter)
-        raw_items = list(page)
+        page_iter  = items_iterable.by_page(continuation_token=token)
+        page       = next(page_iter)
+        raw_items  = list(page)
         next_token = getattr(page, "continuation_token", None)
 
-        # Post-process: fix wrapped LineItems (old docs), build comma-joined columns
         items = []
         for item in raw_items:
-            li_raw = item.pop("lineItems", None) or []
-            pw_shell = _fix_parts_worksheet_line_items({"LineItems": li_raw})
+            li_raw     = item.pop("lineItems", None) or []
+            pw_shell   = _fix_parts_worksheet_line_items({"LineItems": li_raw})
             line_items = pw_shell.get("LineItems") or []
 
             item["parts_Invoice_Seq"]           = _join_all_line_item_values(line_items, "Invoice_Seq")
@@ -874,23 +888,26 @@ def list_results(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json", status_code=200,
         )
     except Exception as e:
-        return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            mimetype="application/json", status_code=500,
+        )
 
 
-# -------------------------
+# ============================================================
 # EXCEL EXPORT
-# Summary sheet: all parts joined with ", " (consistent with UI table)
+# Summary sheet : all parts joined with ", "
 # LineItems sheet: one row per line item (full granularity)
-# -------------------------
+# ============================================================
 def _autosize_columns(ws, max_col: int, max_width: int = 60):
     for col_idx in range(1, max_col + 1):
         col_letter = get_column_letter(col_idx)
-        max_len = 0
-        for cell in ws[col_letter]:
-            if cell.value is None:
-                continue
-            max_len = max(max_len, len(str(cell.value)))
+        max_len = max(
+            (len(str(cell.value)) for cell in ws[col_letter] if cell.value is not None),
+            default=0,
+        )
         ws.column_dimensions[col_letter].width = min(max_len + 2, max_width)
+
 
 @app.route(route="results/excel", methods=["GET"])
 def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
@@ -912,29 +929,31 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         items_iterable = container.query_items(
-            query=query, parameters=params,
-            enable_cross_partition_query=True, max_item_count=200,
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True,
+            max_item_count=200,
         )
-        all_docs = []
-        for page in items_iterable.by_page():
-            all_docs.extend(list(page))
+        all_docs = [doc for page in items_iterable.by_page() for doc in page]
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Summary"
+        wb        = Workbook()
+        ws        = wb.active
+        ws.title  = "Summary"
         ws.append([label for _, label in SUMMARY_COLS])
 
         ws_li = wb.create_sheet("LineItems")
-        ws_li.append(["File Name", "CEVA INVOICE DATE", "Invoice_Seq",
-                       "Invoice_Number", "Part_No", "HTS_code", "Description_of_Goods"])
+        ws_li.append([
+            "File Name", "CEVA INVOICE DATE",
+            "Invoice_Seq", "Invoice_Number", "Part_No",
+            "HTS_code", "Description_of_Goods",
+        ])
 
         for d in all_docs:
-            ceva = d.get("ceva") if isinstance(d.get("ceva"), dict) else {}
+            ceva = d.get("ceva")          if isinstance(d.get("ceva"),          dict) else {}
             es   = d.get("entry_summary") if isinstance(d.get("entry_summary"), dict) else {}
             pw   = d.get("parts_worksheet") if isinstance(d.get("parts_worksheet"), dict) else {}
 
-            # Normalize LineItems at export time — fixes old docs without reprocessing
-            pw = _fix_parts_worksheet_line_items(dict(pw))
+            pw         = _fix_parts_worksheet_line_items(dict(pw))
             line_items = pw.get("LineItems") or []
 
             row = {
@@ -970,7 +989,7 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
                     _safe_to_cell(item.get("Description_of_Goods")),
                 ])
 
-        _autosize_columns(ws, len(SUMMARY_COLS))
+        _autosize_columns(ws,    len(SUMMARY_COLS))
         _autosize_columns(ws_li, 7)
 
         out = io.BytesIO()
@@ -980,7 +999,7 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         range_key    = (req.params.get("range") or "all").strip()
         invoice_from = _parse_iso_date_only(req.params.get("invoiceFrom"))
         invoice_to   = _parse_iso_date_only(req.params.get("invoiceTo"))
-        suffix = range_key.lower() if range_key else "all"
+        suffix       = range_key.lower() if range_key else "all"
         if invoice_from or invoice_to:
             suffix = f"{invoice_from or '...'}_to_{invoice_to or '...'}"
 
@@ -993,4 +1012,7 @@ def export_results_excel(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
-        return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=500)
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            mimetype="application/json", status_code=500,
+        )
