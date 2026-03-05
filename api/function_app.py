@@ -58,12 +58,12 @@ COSMOS_CONTAINER       = os.environ.get("COSMOS_CONTAINER", "results")
 CLASSIFIER_ID          = os.environ.get("DI_CLASSIFIER_ID", "cevadocclassmodel")
 ACTIVE_BATCH_DOC_ID    = "__active_batch__"   # Cosmos sentinel doc — never returned to callers
 
-TARGET_DOC_TYPES = ["CEVA", "ENTRY SUMMARY", "PARTS WORKSHEET"]
+TARGET_DOC_TYPES = ["CEVA", "ENTRY_SUMMARY", "PARTS_WORKSHEET"]
 
 EXTRACTION_MODELS: Dict[str, str] = {
     "CEVA":            "ceva_invoice_model",
-    "ENTRY SUMMARY":   "entry-summary-v1",
-    "PARTS WORKSHEET": "partsworksheet_model",
+    "ENTRY_SUMMARY":   "entry-summary-v1",
+    "PARTS_WORKSHEET": "partsworksheet_model",
 }
 
 DEFAULT_PAGE_SIZE       = 20
@@ -919,15 +919,25 @@ def job_worker(msg: func.QueueMessage) -> None:
         )
         logger.info("[WORKER] CLASSIFIED  job=%s", job_id)
 
+        CONFIDENCE_THRESHOLD = 0.75
+
         best_docs: Dict[str, Dict] = {}
         for doc in clf_result.documents:
             dt    = _normalize_doctype(doc.doc_type)
             conf  = doc.confidence
             pages = [r.page_number for r in doc.bounding_regions]
-            if dt in TARGET_DOC_TYPES:
-                if not best_docs.get(dt) or conf > best_docs[dt]["confidence"]:
-                    best_docs[dt] = {"confidence": conf, "pages": pages}
 
+            if dt not in TARGET_DOC_TYPES:
+                continue
+            if conf < CONFIDENCE_THRESHOLD:
+                logger.info(
+                  "[CLASSIFY] Skipping low-confidence: docType=%s conf=%.2f pages=%s",
+                  dt, conf, pages,
+                )
+                continue
+            if not best_docs.get(dt) or conf > best_docs[dt]["confidence"]:
+                best_docs[dt] = {"confidence": conf, "pages": pages}
+      
         logger.info(
             "[WORKER] Detected: %s  job=%s",
             list(best_docs.keys()), job_id,
