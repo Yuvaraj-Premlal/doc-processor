@@ -912,6 +912,7 @@ def job_worker(msg: func.QueueMessage) -> None:
                 CLASSIFIER_ID,
                 body=pdf_bytes,
                 content_type="application/pdf",
+                split="auto",
             ),
             timeout_sec=DI_CLASSIFY_TIMEOUT_SEC,
             label=f"classify job={job_id}",
