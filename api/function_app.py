@@ -55,7 +55,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 UPLOADS_CONTAINER      = os.environ.get("UPLOADS_CONTAINER", "uploads")
 COSMOS_DATABASE        = os.environ.get("COSMOS_DATABASE", "pdfbundle")
 COSMOS_CONTAINER       = os.environ.get("COSMOS_CONTAINER", "results")
-CLASSIFIER_ID          = os.environ.get("DI_CLASSIFIER_ID", "cevadocmodel")
+CLASSIFIER_ID          = os.environ.get("DI_CLASSIFIER_ID", "cevadocclassmodel")
 ACTIVE_BATCH_DOC_ID    = "__active_batch__"   # Cosmos sentinel doc — never returned to callers
 
 TARGET_DOC_TYPES = ["CEVA", "ENTRY SUMMARY", "PARTS WORKSHEET"]
@@ -69,6 +69,14 @@ EXTRACTION_MODELS: Dict[str, str] = {
 DEFAULT_PAGE_SIZE       = 20
 MAX_PAGE_SIZE           = 200
 CEVA_INVOICE_DATE_FIELD = "INVOICE DATE"
+
+# ── DI timeout / retry ────────────────────────────────────────
+# Azure Functions queue trigger visibility timeout is 10 min (600 s).
+# Keep total DI work well under that so messages are never re-delivered
+# while still processing. Adjust via app settings if your PDFs are large.
+DI_CLASSIFY_TIMEOUT_SEC = int(os.environ.get("DI_CLASSIFY_TIMEOUT_SEC", "120"))
+DI_EXTRACT_TIMEOUT_SEC  = int(os.environ.get("DI_EXTRACT_TIMEOUT_SEC",  "120"))
+DI_MAX_RETRIES          = int(os.environ.get("DI_MAX_RETRIES",          "2"))
 
 # ── Stage constants ───────────────────────────────────────────
 STAGE_QUEUED      = "queued"
@@ -125,6 +133,58 @@ def _cosmos_container():
         credential=os.environ["COSMOS_KEY"],
     )
     return client.get_database_client(COSMOS_DATABASE).get_container_client(COSMOS_CONTAINER)
+
+
+# ════════════════════════════════════════════════════════════════
+# DI CALL WRAPPER — timeout + retry
+#
+# DI pollers (.result()) block indefinitely by default.
+# We run them in a ThreadPoolExecutor so we can impose a hard timeout.
+# On timeout or transient error we retry up to DI_MAX_RETRIES times
+# with a short back-off, then raise so the job is marked failed
+# (not silently stuck forever at "classifying").
+# ════════════════════════════════════════════════════════════════
+import time as _time
+
+def _di_call_with_retry(
+    fn,           # callable that starts the DI operation and returns a poller
+    timeout_sec: int,
+    label: str,   # e.g. "classify" or "extract CEVA" — used in log messages
+) -> Any:
+    """
+    Call fn() to get a DI poller, then wait up to timeout_sec for the result.
+    Retries up to DI_MAX_RETRIES times on any exception or timeout.
+    Raises RuntimeError if all attempts fail — caller records STAGE_FAILED.
+    """
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, DI_MAX_RETRIES + 2):   # +2: first attempt + retries
+        try:
+            logger.info("[DI] %s  attempt=%d/%d", label, attempt, DI_MAX_RETRIES + 1)
+            poller = fn()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(poller.result)
+                try:
+                    return future.result(timeout=timeout_sec)
+                except concurrent.futures.TimeoutError:
+                    raise TimeoutError(
+                        f"DI call '{label}' timed out after {timeout_sec}s "
+                        f"(attempt {attempt})"
+                    )
+
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("[DI] %s  attempt=%d FAILED: %s", label, attempt, exc)
+            if attempt <= DI_MAX_RETRIES:
+                backoff = 5 * attempt
+                logger.info("[DI] Retrying %s in %ds...", label, backoff)
+                _time.sleep(backoff)
+
+    raise RuntimeError(
+        f"DI call '{label}' failed after {DI_MAX_RETRIES + 1} attempts. "
+        f"Last error: {last_exc}"
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -847,12 +907,15 @@ def job_worker(msg: func.QueueMessage) -> None:
         # Parse PDF once — the PdfReader is shared read-only across extraction threads
         reader = PdfReader(io.BytesIO(pdf_bytes))
 
-        clf_poller = _di_client().begin_classify_document(
-            CLASSIFIER_ID,
-            body=pdf_bytes,
-            content_type="application/pdf",
+        clf_result = _di_call_with_retry(
+            fn=lambda: _di_client().begin_classify_document(
+                CLASSIFIER_ID,
+                body=pdf_bytes,
+                content_type="application/pdf",
+            ),
+            timeout_sec=DI_CLASSIFY_TIMEOUT_SEC,
+            label=f"classify job={job_id}",
         )
-        clf_result = clf_poller.result()
         logger.info("[WORKER] CLASSIFIED  job=%s", job_id)
 
         best_docs: Dict[str, Dict] = {}
@@ -897,12 +960,15 @@ def job_worker(msg: func.QueueMessage) -> None:
 
             try:
                 extracted_pdf = _extract_pages(reader, info["pages"])
-                ext_poller    = _di_client().begin_analyze_document(
-                    model_id,
-                    body=extracted_pdf,
-                    content_type="application/pdf",
+                result = _di_call_with_retry(
+                    fn=lambda: _di_client().begin_analyze_document(
+                        model_id,
+                        body=extracted_pdf,
+                        content_type="application/pdf",
+                    ),
+                    timeout_sec=DI_EXTRACT_TIMEOUT_SEC,
+                    label=f"extract {doc_type} job={job_id}",
                 )
-                result     = ext_poller.result()
                 simplified = _simplify_analyze_result(result)
                 fields     = simplified.get("fields", {})
 
@@ -1067,7 +1133,104 @@ def get_job_status(req: func.HttpRequest) -> func.HttpResponse:
         if doc.get(key):
             out[key] = doc[key]
 
+    # ── Stuck detection ───────────────────────────────────────
+    # If a job has been in classifying/extracting/saving for >5 min
+    # without advancing, flag it so the UI can offer a retry.
+    STUCK_THRESHOLD_SEC = 300
+    stage = doc.get("stage") or ""
+    stage_at_str = doc.get("stageAt")
+    if stage in (STAGE_CLASSIFYING, STAGE_EXTRACTING, STAGE_SAVING) and stage_at_str:
+        try:
+            stage_at = datetime.fromisoformat(stage_at_str)
+            if stage_at.tzinfo is None:
+                stage_at = stage_at.replace(tzinfo=timezone.utc)
+            elapsed = (utc_now() - stage_at).total_seconds()
+            if elapsed > STUCK_THRESHOLD_SEC:
+                out["stuck"]          = True
+                out["stuckSec"]       = int(elapsed)
+                out["unstickUrl"]     = f"/api/job/{job_id}/unstick"
+        except Exception:
+            pass
+
     return _json_response(out)
+
+
+# ════════════════════════════════════════════════════════════════
+# HTTP: UNSTICK  POST /job/{jobId}/unstick
+#
+# Re-queues a job that is stuck in classifying/extracting/saving.
+# Reuses the original blob path so no re-upload is needed.
+# ════════════════════════════════════════════════════════════════
+@app.route(route="job/{jobId}/unstick", methods=["POST"])
+def unstick_job(req: func.HttpRequest) -> func.HttpResponse:
+    job_id = req.route_params.get("jobId")
+    if not job_id:
+        return _json_response({"error": "Missing jobId"}, status_code=400)
+
+    try:
+        container = _cosmos_container()
+        doc       = container.read_item(item=job_id, partition_key=job_id)
+    except CosmosResourceNotFoundError:
+        return _json_response({"error": "Job not found"}, status_code=404)
+
+    stage = doc.get("stage") or doc.get("status")
+    if stage in (STAGE_COMPLETED, STAGE_DISCARDED):
+        return _json_response(
+            {"error": f"Cannot unstick a job in stage '{stage}'"},
+            status_code=400,
+        )
+
+    blob_path = doc.get("sourcePdfBlobPath")
+    file_name = doc.get("fileName")
+    batch_id  = doc.get("batchId")
+
+    if not blob_path:
+        return _json_response(
+            {"error": "No source blob path on record — cannot re-queue"},
+            status_code=400,
+        )
+
+    # Verify the blob still exists before re-queuing
+    try:
+        _blob_service().get_container_client(UPLOADS_CONTAINER) \
+            .get_blob_client(blob_path).get_blob_properties()
+    except Exception:
+        return _json_response(
+            {"error": "Source blob no longer exists — original PDF was already cleaned up. Re-upload the file."},
+            status_code=409,
+        )
+
+    now = utc_now_iso()
+
+    # Reset stage to queued and re-queue
+    stagelog = doc.get("stagelog") or []
+    stagelog.append({"stage": "unstick_requested", "at": now})
+    stagelog.append({"stage": STAGE_QUEUED,         "at": now})
+
+    container.upsert_item({
+        **doc,
+        "status":   STAGE_QUEUED,
+        "stage":    STAGE_QUEUED,
+        "stageAt":  now,
+        "stagelog": stagelog,
+        "unstuckAt": now,
+    })
+
+    msg = _queue_client().send_message(json.dumps({
+        "jobId":       job_id,
+        "pdfBlobPath": blob_path,
+        "fileName":    file_name,
+        "batchId":     batch_id,
+    }))
+    logger.info("[UNSTICK] Re-queued job=%s  msgId=%s", job_id, msg.id)
+
+    return _json_response({
+        "jobId":     job_id,
+        "fileName":  file_name,
+        "stage":     STAGE_QUEUED,
+        "messageId": msg.id,
+        "unstuckAt": now,
+    })
 
 
 # ════════════════════════════════════════════════════════════════
