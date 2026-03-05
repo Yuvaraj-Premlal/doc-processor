@@ -595,101 +595,100 @@ def job_worker(msg: func.QueueMessage) -> None:
             "status": "processing",
         })
 
-        if not job_id or not pdf_blob_path:
-            raise ValueError("Queue payload missing jobId or pdfBlobPath")
-
         pdf_bytes = uploads.get_blob_client(pdf_blob_path).download_blob().readall()
-        pages = split_pdf_to_single_pages(pdf_bytes)
-        total_pages = len(pages)
         client = di_client()
 
-        # 1) Classify each page
-        page_results = []
-        failures = []
-        for item in pages:
-            pno = item["pageNumber"]
-            one_pdf = item["pdfBytes"]
-            try:
-                poller = client.begin_classify_document(
-                    CLASSIFIER_ID, body=one_pdf, content_type="application/pdf",
-                )
-                result = poller.result()
-                docs = getattr(result, "documents", None) or []
-                if docs:
-                    d0 = docs[0]
-                    doc_type = getattr(d0, "doc_type", None) or getattr(d0, "docType", None)
-                    conf = getattr(d0, "confidence", None)
-                else:
-                    doc_type, conf = None, None
-                page_results.append({"pageNumber": pno, "docType": doc_type, "confidence": conf, "pdf": one_pdf})
-            except Exception as e:
-                failures.append({"pageNumber": pno, "error": str(e)})
+        # -------------------------------------------------------
+        # 1️⃣ Classify ENTIRE PDF once
+        # -------------------------------------------------------
+        poller = client.begin_classify_document(
+            CLASSIFIER_ID,
+            body=pdf_bytes,
+            content_type="application/pdf",
+        )
 
-        # 2) Pick best page per target doc type
-        best_pages = {}
-        for target in TARGET_DOC_TYPES:
-            matches = [
-                r for r in page_results
-                if normalize_doctype(r.get("docType")) == normalize_doctype(target)
-                and isinstance(r.get("confidence"), (int, float))
-            ]
-            matches.sort(key=lambda x: float(x["confidence"]), reverse=True)
-            if matches:
-                best_pages[target] = matches[0]
+        classification_result = poller.result()
 
-        # 3) Extract fields
+        best_docs = {}
+
+        for doc in classification_result.documents:
+            doc_type = normalize_doctype(doc.doc_type)
+            confidence = doc.confidence
+
+            pages = [r.page_number for r in doc.bounding_regions]
+
+            if doc_type in TARGET_DOC_TYPES:
+                existing = best_docs.get(doc_type)
+
+                if not existing or confidence > existing["confidence"]:
+                    best_docs[doc_type] = {
+                        "confidence": confidence,
+                        "pages": pages
+                    }
+
+        # -------------------------------------------------------
+        # Helper to extract specific pages
+        # -------------------------------------------------------
+        def extract_pages(pdf_bytes: bytes, page_numbers: list[int]) -> bytes:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            writer = PdfWriter()
+
+            for p in page_numbers:
+                writer.add_page(reader.pages[p - 1])
+
+            buf = io.BytesIO()
+            writer.write(buf)
+            return buf.getvalue()
+
+        # -------------------------------------------------------
+        # 2️⃣ Run extraction models
+        # -------------------------------------------------------
         merged = {}
         picked_pages = {}
         confidence = {}
         extracted_docs = []
 
-        for doc_type, info in best_pages.items():
+        for doc_type, info in best_docs.items():
+
             model_id = EXTRACTION_MODELS.get(doc_type)
             if not model_id:
                 continue
 
-            def analyze(pdf_bytes_to_use: bytes):
-                poller = client.begin_analyze_document(
-                    model_id, body=pdf_bytes_to_use, content_type="application/pdf",
-                )
-                return poller.result()
+            extracted_pdf = extract_pages(pdf_bytes, info["pages"])
 
-            analyze_result = analyze(info["pdf"])
+            poller = client.begin_analyze_document(
+                model_id,
+                body=extracted_pdf,
+                content_type="application/pdf"
+            )
+
+            analyze_result = poller.result()
+
             simplified = simplify_analyze_result(analyze_result)
-            used_rotation = 0
 
-            # Rotation fallback for PARTS WORKSHEET
-            if normalize_doctype(doc_type) == "PARTS WORKSHEET" and not simplified.get("hasData", False):
-                try:
-                    rotated = rotate_pdf_bytes(info["pdf"], ROTATION_FALLBACK_DEGREES)
-                    analyze2 = analyze(rotated)
-                    simplified2 = simplify_analyze_result(analyze2)
-                    if simplified2.get("hasData", False) and len(simplified2.get("fields", {})) >= len(simplified.get("fields", {})):
-                        simplified = simplified2
-                        used_rotation = ROTATION_FALLBACK_DEGREES
-                except Exception:
-                    pass
-
-            key = safe_slug(doc_type).lower()
             fields = simplified.get("fields", {})
 
-            # FIX: Normalize parts_worksheet LineItems into a clean plain list.
-            # Handles DI wrapper objects, content-only fields, and deduplicates
-            # space-joined repeated values from multi-span OCR extraction.
+            key = safe_slug(doc_type).lower()
+
             if key == "parts_worksheet":
                 fields = _fix_parts_worksheet_line_items(fields)
 
             merged[key] = fields
-            picked_pages[doc_type] = info.get("pageNumber")
-            confidence[doc_type] = info.get("confidence")
+
+            picked_pages[doc_type] = info["pages"]
+
+            confidence[doc_type] = info["confidence"]
+
             extracted_docs.append({
                 "docType": doc_type,
                 "modelId": model_id,
-                "page": info.get("pageNumber"),
-                "rotationAppliedDegrees": used_rotation,
-                "fieldCount": len(fields),
+                "pages": info["pages"],
+                "fieldCount": len(fields)
             })
 
+        # -------------------------------------------------------
+        # 3️⃣ Save final document
+        # -------------------------------------------------------
         final_doc = {
             "id": job_id,
             "type": "bundle_result",
@@ -698,19 +697,16 @@ def job_worker(msg: func.QueueMessage) -> None:
             "completedAt": utc_now_iso(),
             "status": "completed",
             "sourcePdfBlobPath": pdf_blob_path,
-            "bundleDiagnostics": {
-                "downloadedBytes": len(pdf_bytes),
-                "totalPages": total_pages,
-                "failedPages": len(failures),
-                "failures": failures,
-            },
             "pickedPages": picked_pages,
             "confidence": confidence,
             "extractedDocs": extracted_docs,
             **merged,
         }
+
         final_doc["cevaInvoiceDate"] = _extract_ceva_invoice_date(final_doc)
+
         container.upsert_item(final_doc)
+
         delete_prefix(uploads, f"{job_id}/")
 
     except Exception as e:
@@ -725,7 +721,6 @@ def job_worker(msg: func.QueueMessage) -> None:
             "sourcePdfBlobPath": pdf_blob_path,
         })
         raise
-
 
 # -------------------------
 # HTTP: JOB UI (UI-READY)
