@@ -1,96 +1,600 @@
 <!DOCTYPE html>
-<html>
+<html lang="en" data-theme="light">
 <head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Document Bundle Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+
   <style>
-    body { font-family: Arial; margin: 30px; }
-    table { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
-    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; vertical-align: top; }
-    th { background: #f4f4f4; position: sticky; top: 0; z-index: 1; }
-    .row { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap: wrap; }
-    .muted { color:#666; font-size: 13px; }
-    .ok { color: #0a7a0a; font-weight: 600; }
-    .err { color: #b00020; font-weight: 600; }
-    .processing { color: #d97706; font-weight: 600; }
-    .box { padding: 12px; border: 1px solid #ddd; border-radius: 6px; margin-bottom: 14px; }
-    button { padding: 6px 10px; cursor:pointer; }
-    input[type="text"], input[type="date"], select { padding: 6px; }
-    tr.clickable:hover { background:#f2f7ff; cursor:pointer; }
-    .small { font-size: 12px; }
-    .widewrap { overflow:auto; max-height: 520px; border:1px solid #eee; }
-    .section { margin-bottom: 20px; }
+    /* ── TOKENS ─────────────────────────────────────────── */
+    :root {
+      --intel-blue:       #0071C5;
+      --intel-blue-dark:  #005A9E;
+      --intel-blue-pale:  #E6F2FB;
+      --intel-blue-mid:   #B3D6F0;
+
+      --bg:           #F5F7FA;
+      --surface:      #FFFFFF;
+      --surface-2:    #EEF2F7;
+      --border:       #D0DAE6;
+      --text:         #0D1B2A;
+      --text-muted:   #5A6E82;
+      --text-light:   #8FA3B8;
+
+      --ok:     #0A7C4F;
+      --ok-bg:  #E6F4EE;
+      --err:    #C0182B;
+      --err-bg: #FDEEF0;
+      --warn:   #A85C00;
+      --warn-bg:#FFF4E0;
+
+      --radius: 6px;
+      --shadow: 0 1px 4px rgba(0,0,0,.08), 0 4px 16px rgba(0,113,197,.06);
+      --font-sans: 'IBM Plex Sans', system-ui, sans-serif;
+      --font-mono: 'IBM Plex Mono', monospace;
+    }
+
+    [data-theme="dark"] {
+      --bg:           #0B1622;
+      --surface:      #132233;
+      --surface-2:    #1C3047;
+      --border:       #243C55;
+      --text:         #E8F0F8;
+      --text-muted:   #7BA3C4;
+      --text-light:   #4A718E;
+
+      --intel-blue:       #3A9FDE;
+      --intel-blue-dark:  #2D85BB;
+      --intel-blue-pale:  #0D2135;
+      --intel-blue-mid:   #1A3D5C;
+
+      --ok:     #2DD48A;
+      --ok-bg:  #0C2B1E;
+      --err:    #F46B7A;
+      --err-bg: #2B0E12;
+      --warn:   #F4B554;
+      --warn-bg:#2B1C00;
+
+      --shadow: 0 1px 4px rgba(0,0,0,.3), 0 4px 20px rgba(0,0,0,.25);
+    }
+
+    /* ── RESET ──────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font-sans);
+      font-size: 14px;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+      transition: background .2s, color .2s;
+    }
+
+    /* ── LAYOUT ─────────────────────────────────────────── */
+    .app-header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 56px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 1px 0 var(--border);
+    }
+
+    .app-header .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .intel-mark {
+      width: 36px;
+      height: 36px;
+      background: var(--intel-blue);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: -.5px;
+      flex-shrink: 0;
+    }
+
+    .brand-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -.2px;
+    }
+
+    .brand-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-weight: 400;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .main {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 28px 32px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* ── CARD ───────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .card-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .card-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--text-muted);
+    }
+
+    .card-body {
+      padding: 20px;
+    }
+
+    .card-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    /* ── FORM CONTROLS ──────────────────────────────────── */
+    input[type="text"],
+    input[type="date"],
+    select {
+      height: 36px;
+      padding: 0 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      outline: none;
+      transition: border-color .15s, box-shadow .15s;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+
+    input[type="text"]:focus,
+    input[type="date"]:focus,
+    select:focus {
+      border-color: var(--intel-blue);
+      box-shadow: 0 0 0 3px rgba(0,113,197,.15);
+    }
+
+    input[type="text"]::placeholder { color: var(--text-light); }
+
+    input#jobIdInput { width: 380px; font-family: var(--font-mono); font-size: 12px; }
+
+    select { padding-right: 28px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235A6E82' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; }
+
+    input[type="file"] {
+      font-size: 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+
+    input[type="file"]::file-selector-button {
+      height: 32px;
+      padding: 0 14px;
+      background: var(--intel-blue-pale);
+      color: var(--intel-blue);
+      border: 1px solid var(--intel-blue-mid);
+      border-radius: var(--radius);
+      font-family: var(--font-sans);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      margin-right: 10px;
+      transition: background .15s;
+    }
+    input[type="file"]::file-selector-button:hover { background: var(--intel-blue-mid); }
+
+    /* ── BUTTONS ────────────────────────────────────────── */
+    button {
+      height: 36px;
+      padding: 0 16px;
+      border-radius: var(--radius);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: background .15s, box-shadow .15s, transform .08s;
+      white-space: nowrap;
+    }
+    button:active { transform: scale(.97); }
+
+    .btn-primary {
+      background: var(--intel-blue);
+      color: #fff;
+    }
+    .btn-primary:hover { background: var(--intel-blue-dark); }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
+
+    .btn-outline {
+      background: transparent;
+      color: var(--intel-blue);
+      border: 1px solid var(--intel-blue);
+    }
+    .btn-outline:hover { background: var(--intel-blue-pale); }
+
+    .btn-sm { height: 30px; padding: 0 12px; font-size: 12px; }
+
+    .icon-btn {
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text-muted);
+    }
+    .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+
+    /* ── STATUS BADGES ──────────────────────────────────── */
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 20px;
+    }
+    .status::before {
+      content: '';
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-ok  { color: var(--ok);  background: var(--ok-bg);  }
+    .status-ok::before  { background: var(--ok);  }
+    .status-err { color: var(--err); background: var(--err-bg); }
+    .status-err::before { background: var(--err); }
+    .status-proc { color: var(--warn); background: var(--warn-bg); }
+    .status-proc::before { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: .3; }
+    }
+
+    .plain-status {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* ── TABLE ──────────────────────────────────────────── */
+    .table-wrap {
+      overflow: auto;
+      max-height: 480px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12.5px;
+    }
+
+    thead tr {
+      background: var(--surface-2);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    th {
+      padding: 10px 14px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+      vertical-align: top;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    tbody tr {
+      transition: background .1s;
+      cursor: pointer;
+    }
+    tbody tr:hover { background: var(--intel-blue-pale); }
+    tbody tr:last-child td { border-bottom: none; }
+
+    /* ── DETAIL SECTIONS ────────────────────────────────── */
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 16px;
+    }
+
+    .detail-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .detail-card h3 {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--intel-blue);
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--intel-blue-mid);
+      background: var(--intel-blue-pale);
+    }
+
+    .detail-card table { font-size: 12.5px; }
+    .detail-card th {
+      width: 40%;
+      font-weight: 500;
+      font-size: 12px;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--text-muted);
+      background: none;
+      white-space: normal;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-card td {
+      max-width: none;
+      white-space: normal;
+      word-break: break-word;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-card tr:last-child th,
+    .detail-card tr:last-child td { border-bottom: none; }
+
+    /* ── PARTS TABLE ────────────────────────────────────── */
+    .parts-full { overflow: auto; }
+    .parts-full table { min-width: 900px; }
+
+    /* ── PAGINATION ROW ─────────────────────────────────── */
+    .pagination-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── DIVIDER ────────────────────────────────────────── */
+    .filter-divider {
+      width: 1px;
+      height: 24px;
+      background: var(--border);
+      margin: 0 4px;
+    }
+
+    /* ── EMPTY STATE ────────────────────────────────────── */
+    .empty {
+      padding: 48px 20px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* ── SECTION LABEL ──────────────────────────────────── */
+    .section-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--text-light);
+    }
+
+    /* ── SUPPLIER BADGE ─────────────────────────────────── */
+    .supplier-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--intel-blue-pale);
+      color: var(--intel-blue);
+      border: 1px solid var(--intel-blue-mid);
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    /* ── SCROLLBAR ──────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-light); }
+
+    /* ── THEME TOGGLE ───────────────────────────────────── */
+    #themeToggle svg { pointer-events: none; }
+
+    /* ── ANIMATIONS ─────────────────────────────────────── */
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .card { animation: fadeIn .25s ease both; }
+
+    /* ── MONO TEXT ──────────────────────────────────────── */
+    .mono { font-family: var(--font-mono); font-size: 12px; }
   </style>
 </head>
 <body>
 
-<h2>Document Bundle Viewer</h2>
-
-<!-- Upload -->
-<div class="box">
-  <div class="row">
-    <input type="file" id="fileInput" multiple />
-    <button onclick="uploadFiles()">Upload</button>
-    <span class="muted">Upload PDF(s) or a ZIP containing PDFs</span>
-  </div>
-  <div id="uploadStatus" class="muted"></div>
-</div>
-
-<!-- Manual Load -->
-<div class="box">
-  <div class="row">
-    <input type="text" id="jobIdInput" placeholder="Enter Job ID" style="width:520px;">
-    <button onclick="loadJob()">Load</button>
-  </div>
-  <div id="loadStatus" class="muted"></div>
-</div>
-
-<!-- Filters + Results -->
-<div class="box">
-  <div class="row">
-    <h3 style="margin:0;">Processed Bundles</h3>
-    <span class="muted small">Invoice filters = CEVA INVOICE DATE.</span>
+<!-- ═══════════════════ HEADER ═══════════════════ -->
+<header class="app-header">
+  <div class="brand">
+    <div class="intel-mark">DB</div>
+    <div>
+      <div class="brand-title">Document Bundle Viewer</div>
+      <div class="brand-sub">Powered by Intel Infrastructure</div>
+    </div>
   </div>
 
-  <div class="row">
-    <label class="small">Quick (Invoice Date):</label>
-    <select id="range">
-      <option value="all">All</option>
-      <option value="last_7_days">Last 7 days</option>
-      <option value="last_30_days">Last 30 days</option>
-      <option value="last_month">Last month</option>
-    </select>
+  <div class="header-actions">
+    <button class="icon-btn" id="themeToggle" onclick="toggleTheme()" title="Toggle theme">
+      <svg id="themeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/>
+        <line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/>
+        <line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+      </svg>
+    </button>
+  </div>
+</header>
 
-    <label class="small">Invoice From:</label>
-    <input type="date" id="invoiceFrom" />
+<!-- ═══════════════════ MAIN ═══════════════════ -->
+<main class="main">
 
-    <label class="small">Invoice To:</label>
-    <input type="date" id="invoiceTo" />
-
-    <button onclick="applyFilters()">Apply</button>
-    <button onclick="clearFilters()">Clear</button>
-    <button onclick="downloadExcel()">Download Excel</button>
+  <!-- Upload -->
+  <div class="card">
+    <div class="card-header">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--intel-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0018 9h-1.26A8 8 0 103 16.3"/></svg>
+      <span class="card-title">Upload Documents</span>
+    </div>
+    <div class="card-body">
+      <div class="card-row">
+        <input type="file" id="fileInput" multiple />
+        <button class="btn-primary" onclick="uploadFiles()">Upload</button>
+        <span class="plain-status" id="uploadStatus"></span>
+      </div>
+      <p style="font-size:11px; color:var(--text-light); margin-top:8px;">Accepts PDF files or a ZIP archive containing PDFs.</p>
+    </div>
   </div>
 
-  <div id="listStatus" class="muted small"></div>
-
-  <div class="widewrap">
-    <table>
-      <thead>
-        <tr id="resultsHeader"></tr>
-      </thead>
-      <tbody id="resultsTable"></tbody>
-    </table>
+  <!-- Load by Job ID -->
+  <div class="card">
+    <div class="card-header">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--intel-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <span class="card-title">Load by Job ID</span>
+    </div>
+    <div class="card-body">
+      <div class="card-row">
+        <input type="text" id="jobIdInput" placeholder="Enter Job ID" />
+        <button class="btn-primary" onclick="loadJob()">Load</button>
+        <span class="plain-status" id="loadStatus"></span>
+      </div>
+    </div>
   </div>
 
-  <div class="row">
-    <button onclick="loadMore()">Load More</button>
-    <span id="moreHint" class="muted small"></span>
-  </div>
-</div>
+  <!-- Results -->
+  <div class="card">
+    <div class="card-header">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--intel-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="9" x2="9" y2="21"/></svg>
+      <span class="card-title">Processed Bundles</span>
+      <span style="flex:1"></span>
+      <span class="plain-status" id="listStatus"></span>
+    </div>
 
-<div id="output"></div>
+    <!-- Filters -->
+    <div class="card-body" style="padding-bottom:16px;">
+      <div class="card-row">
+        <span class="section-label">Filter by Invoice Date</span>
+        <div class="filter-divider"></div>
+
+        <select id="range">
+          <option value="all">All time</option>
+          <option value="last_7_days">Last 7 days</option>
+          <option value="last_30_days">Last 30 days</option>
+          <option value="last_month">Last month</option>
+        </select>
+
+        <input type="date" id="invoiceFrom" title="Invoice from" />
+        <span style="font-size:12px; color:var(--text-muted);">—</span>
+        <input type="date" id="invoiceTo" title="Invoice to" />
+
+        <div class="filter-divider"></div>
+        <button class="btn-primary btn-sm" onclick="applyFilters()">Apply</button>
+        <button class="btn-ghost btn-sm" onclick="clearFilters()">Clear</button>
+        <button class="btn-outline btn-sm" onclick="downloadExcel()">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline;margin-right:4px;vertical-align:-1px"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export Excel
+        </button>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr id="resultsHeader"></tr></thead>
+        <tbody id="resultsTable"></tbody>
+      </table>
+    </div>
+
+    <div class="pagination-row">
+      <button class="btn-ghost btn-sm" onclick="loadMore()">Load more</button>
+      <span id="moreHint" class="plain-status"></span>
+    </div>
+  </div>
+
+  <!-- Detail Output -->
+  <div id="output"></div>
+
+</main>
 
 <script>
+/* ── STATE ──────────────────────────────────────────────────── */
 let continuationToken = null;
 let currentJobPolling = null;
 
@@ -98,35 +602,56 @@ function apiBase() {
   return "https://yavi-b4bahkdqced4ayhh.canadacentral-01.azurewebsites.net/api";
 }
 
+/* ── THEME ──────────────────────────────────────────────────── */
+function toggleTheme() {
+  const html = document.documentElement;
+  const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  updateThemeIcon(next);
+}
+
+function updateThemeIcon(theme) {
+  const icon = document.getElementById('themeIcon');
+  if (theme === 'dark') {
+    icon.innerHTML = '<path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>';
+  } else {
+    icon.innerHTML = '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>';
+  }
+}
+
+(function initTheme() {
+  const saved = localStorage.getItem('theme') || 'light';
+  document.documentElement.setAttribute('data-theme', saved);
+  updateThemeIcon(saved);
+})();
+
+/* ── COLUMNS ────────────────────────────────────────────────── */
 const COLS = [
   { key: "fileName",                   label: "File Name" },
-  { key: "cevaInvoiceDate",            label: "CEVA INVOICE DATE" },
-  { key: "invoiceNumber",              label: "INVOICE NUMBER" },
-  { key: "entryNumber",                label: "ENTRY NUMBER" },
-  { key: "departureDate",              label: "DEPARTURE DATE" },
-  { key: "arrivalDate",                label: "ARRIVAL DATE" },
-  { key: "descriptionOfGoods",         label: "DESCRIPTION OF GOODS" },
-  { key: "totalEnteredValue",          label: "TOTAL ENTERED VALUE" },
-  { key: "totalOtherFees",             label: "TOTAL OTHER FEES" },
-  { key: "duty",                       label: "DUTY" },
-  { key: "supplier",                   label: "SUPPLIER" },
-  { key: "parts_Invoice_Seq",          label: "PARTS Invoice_Seq" },
-  { key: "parts_Invoice_Number",       label: "PARTS Invoice_Number" },
-  { key: "parts_Part_No",              label: "PARTS Part_No" },
-  { key: "parts_HTS_code",             label: "PARTS HTS_code" },
-  { key: "parts_Description_of_Goods", label: "PARTS Description_of_Goods" },
+  { key: "cevaInvoiceDate",            label: "CEVA Invoice Date" },
+  { key: "invoiceNumber",              label: "Invoice #" },
+  { key: "entryNumber",                label: "Entry #" },
+  { key: "departureDate",              label: "Departure" },
+  { key: "arrivalDate",                label: "Arrival" },
+  { key: "descriptionOfGoods",         label: "Description" },
+  { key: "totalEnteredValue",          label: "Entered Value" },
+  { key: "totalOtherFees",             label: "Other Fees" },
+  { key: "duty",                       label: "Duty" },
+  { key: "supplier",                   label: "Supplier" },
+  { key: "parts_Invoice_Seq",          label: "Inv. Seq" },
+  { key: "parts_Invoice_Number",       label: "Inv. Number" },
+  { key: "parts_Part_No",              label: "Part No." },
+  { key: "parts_HTS_code",             label: "HTS Code" },
+  { key: "parts_Description_of_Goods", label: "Parts Description" },
 ];
 
 function setHeaders() {
   const tr = document.getElementById("resultsHeader");
-  tr.innerHTML = "";
-  COLS.forEach(c => {
-    const th = document.createElement("th");
-    th.textContent = c.label;
-    tr.appendChild(th);
-  });
+  tr.innerHTML = COLS.map(c => `<th>${c.label}</th>`).join("");
 }
 
+/* ── FILTERS ────────────────────────────────────────────────── */
 function getFilters() {
   return {
     range: document.getElementById("range").value,
@@ -135,7 +660,7 @@ function getFilters() {
   };
 }
 
-function buildResultsUrl(pageSize=20) {
+function buildResultsUrl(pageSize = 20) {
   const { range, invoiceFrom, invoiceTo } = getFilters();
   let url = `${apiBase()}/results?pageSize=${pageSize}`;
   if (range && range !== "all") url += `&range=${encodeURIComponent(range)}`;
@@ -151,81 +676,58 @@ function downloadExcel() {
   if (range && range !== "all") params.push(`range=${encodeURIComponent(range)}`);
   if (invoiceFrom) params.push(`invoiceFrom=${encodeURIComponent(invoiceFrom)}`);
   if (invoiceTo) params.push(`invoiceTo=${encodeURIComponent(invoiceTo)}`);
-  const url = `${apiBase()}/results/excel` + (params.length ? `?${params.join("&")}` : "");
-  window.location.href = url;
+  window.location.href = `${apiBase()}/results/excel` + (params.length ? `?${params.join("&")}` : "");
 }
 
+/* ── UPLOAD ─────────────────────────────────────────────────── */
 async function uploadFiles() {
   const el = document.getElementById("fileInput");
   const statusEl = document.getElementById("uploadStatus");
-  statusEl.className = "muted";
-  statusEl.textContent = "";
+  setStatus(statusEl, "", "plain");
 
-  if (!el.files.length) {
-    statusEl.className = "err";
-    statusEl.textContent = "Select PDF(s) or ZIP.";
-    return;
-  }
+  if (!el.files.length) { setStatus(statusEl, "Please select PDF(s) or a ZIP file.", "err"); return; }
 
   const fd = new FormData();
   for (const f of el.files) fd.append("files", f);
-  statusEl.textContent = "Uploading...";
+  setStatus(statusEl, "Uploading…", "proc");
 
   try {
-    const res = await fetch(`${apiBase()}/upload`, { method:"POST", body: fd });
+    const res = await fetch(`${apiBase()}/upload`, { method: "POST", body: fd });
     const text = await res.text();
-
-    if (!res.ok) {
-      statusEl.className = "err";
-      statusEl.textContent = `Upload failed (${res.status}): ${text}`;
-      return;
-    }
+    if (!res.ok) { setStatus(statusEl, `Upload failed (${res.status}): ${text}`, "err"); return; }
 
     const data = JSON.parse(text);
     const jobs = data.jobs || [];
 
     if (data.jobId) {
-      statusEl.className = "ok";
-      statusEl.textContent = `Uploaded. Job ID: ${data.jobId}`;
+      setStatus(statusEl, `Uploaded — Job ID: ${data.jobId}`, "ok");
       document.getElementById("jobIdInput").value = data.jobId;
       await refreshResults();
       loadJob(data.jobId);
       return;
     }
-
-    statusEl.className = "ok";
-    statusEl.textContent = `Uploaded ZIP batch (${data.batchId}). Created ${jobs.length} job(s).`;
+    setStatus(statusEl, `ZIP batch (${data.batchId}) — ${jobs.length} job(s) created.`, "ok");
     await refreshResults();
-
-    if (jobs.length) {
-      document.getElementById("jobIdInput").value = jobs[0].jobId;
-      loadJob(jobs[0].jobId);
-    }
+    if (jobs.length) { document.getElementById("jobIdInput").value = jobs[0].jobId; loadJob(jobs[0].jobId); }
   } catch (e) {
-    statusEl.className = "err";
-    statusEl.textContent = "Connection error while uploading: " + e;
+    setStatus(statusEl, "Connection error: " + e, "err");
   }
 }
 
-async function loadResults(reset=false) {
+/* ── RESULTS ────────────────────────────────────────────────── */
+async function loadResults(reset = false) {
   const listStatus = document.getElementById("listStatus");
-  listStatus.className = "muted small";
-  listStatus.textContent = "Loading results...";
+  setStatus(listStatus, "Loading…", "plain");
 
   if (reset) {
     continuationToken = null;
     document.getElementById("resultsTable").innerHTML = "";
   }
 
-  const url = buildResultsUrl(20);
-  const res = await fetch(url);
+  const res = await fetch(buildResultsUrl(20));
   const data = await res.json();
 
-  if (!res.ok) {
-    listStatus.className = "err";
-    listStatus.textContent = data.error || `Error loading results (${res.status})`;
-    return;
-  }
+  if (!res.ok) { setStatus(listStatus, data.error || `Error (${res.status})`, "err"); return; }
 
   const items = data.items || [];
   continuationToken = data.continuationToken;
@@ -233,30 +735,21 @@ async function loadResults(reset=false) {
 
   items.forEach(item => {
     const tr = document.createElement("tr");
-    tr.className = "clickable";
     tr.onclick = () => loadJob(item.id);
-    // safeCell: never render raw objects — stringify if needed
-    tr.innerHTML = COLS.map(c => `<td>${safeCell(item[c.key])}</td>`).join("");
+    tr.innerHTML = COLS.map(c => `<td class="${['fileName','invoiceNumber','entryNumber','parts_Invoice_Number','parts_Part_No','parts_HTS_code'].includes(c.key) ? 'mono' : ''}">${safeCell(item[c.key])}</td>`).join("");
     tbody.appendChild(tr);
   });
 
   if (!items.length && reset) {
-    listStatus.textContent = "No results for these filters.";
+    tbody.innerHTML = `<tr><td colspan="${COLS.length}"><div class="empty">No results for the current filters.</div></td></tr>`;
+    setStatus(listStatus, "", "plain");
   } else {
-    listStatus.textContent = `Loaded ${items.length} row(s).`;
+    setStatus(listStatus, `${items.length} row(s) loaded`, "plain");
   }
 
-  document.getElementById("moreHint").textContent =
-    continuationToken ? "More available…" : "End of list.";
+  document.getElementById("moreHint").textContent = continuationToken ? "More results available" : "End of results";
 }
 
-/**
- * safeCell: convert any value to a safe HTML string for table cells.
- * - null/undefined => ""
- * - string/number  => as-is
- * - array of strings => join with ", "
- * - object         => JSON string (never [object Object])
- */
 function safeCell(v) {
   if (v == null) return "";
   if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return String(v);
@@ -265,20 +758,9 @@ function safeCell(v) {
   return String(v);
 }
 
-function loadMore() {
-  if (continuationToken) loadResults(false);
-}
-
-async function refreshResults() {
-  setHeaders();
-  await loadResults(true);
-}
-
-async function applyFilters() {
-  continuationToken = null;
-  await refreshResults();
-}
-
+function loadMore() { if (continuationToken) loadResults(false); }
+async function refreshResults() { setHeaders(); await loadResults(true); }
+async function applyFilters() { continuationToken = null; await refreshResults(); }
 async function clearFilters() {
   document.getElementById("range").value = "all";
   document.getElementById("invoiceFrom").value = "";
@@ -287,147 +769,116 @@ async function clearFilters() {
   await refreshResults();
 }
 
+/* ── JOB DETAIL ─────────────────────────────────────────────── */
 async function loadJob(jobIdOverride) {
   const jobId = (jobIdOverride || document.getElementById("jobIdInput").value).trim();
   const loadStatus = document.getElementById("loadStatus");
-
-  if (!jobId) {
-    loadStatus.className = "err";
-    loadStatus.textContent = "Enter Job ID";
-    return;
-  }
+  if (!jobId) { setStatus(loadStatus, "Please enter a Job ID.", "err"); return; }
 
   document.getElementById("jobIdInput").value = jobId;
-  loadStatus.className = "muted";
-  loadStatus.textContent = "Loading...";
+  setStatus(loadStatus, "Loading…", "plain");
 
   try {
     const res = await fetch(`${apiBase()}/job/${jobId}/ui`);
     const data = await res.json();
 
     if (data.status === "processing") {
-      loadStatus.className = "processing";
-      loadStatus.textContent = "Processing... (auto-refresh every 3 seconds)";
+      setStatus(loadStatus, "Processing… (auto-refresh every 3s)", "proc");
       if (!currentJobPolling) currentJobPolling = setInterval(() => loadJob(jobId), 3000);
       return;
     }
 
-    if (currentJobPolling) {
-      clearInterval(currentJobPolling);
-      currentJobPolling = null;
-    }
+    if (currentJobPolling) { clearInterval(currentJobPolling); currentJobPolling = null; }
 
     if (data.status === "failed") {
-      loadStatus.className = "err";
-      loadStatus.textContent = "Processing failed.";
-      document.getElementById("output").innerHTML = `<p class="err">${data.error || "Unknown error"}</p>`;
+      setStatus(loadStatus, "Processing failed.", "err");
+      document.getElementById("output").innerHTML = `<div class="card card-body"><p style="color:var(--err)">${data.error || "Unknown error"}</p></div>`;
       return;
     }
 
-    loadStatus.className = "ok";
-    loadStatus.textContent = "Loaded.";
+    setStatus(loadStatus, "Loaded successfully.", "ok");
     renderDetails(data);
 
   } catch (e) {
-    if (currentJobPolling) {
-      clearInterval(currentJobPolling);
-      currentJobPolling = null;
-    }
-    loadStatus.className = "err";
-    loadStatus.textContent = "Connection error.";
-    document.getElementById("output").innerHTML = "<p class='err'>Connection error. Check CORS / API.</p>";
+    if (currentJobPolling) { clearInterval(currentJobPolling); currentJobPolling = null; }
+    setStatus(loadStatus, "Connection error.", "err");
+    document.getElementById("output").innerHTML = `<div class="card card-body"><p style="color:var(--err)">Connection error — check CORS / API configuration.</p></div>`;
   }
 }
 
+/* ── RENDER HELPERS ─────────────────────────────────────────── */
+function setStatus(el, msg, type) {
+  if (!msg) { el.textContent = ""; el.className = "plain-status"; return; }
+  if (type === "ok")    { el.innerHTML = `<span class="status status-ok">${msg}</span>`; }
+  else if (type === "err")  { el.innerHTML = `<span class="status status-err">${msg}</span>`; }
+  else if (type === "proc") { el.innerHTML = `<span class="status status-proc">${msg}</span>`; }
+  else { el.textContent = msg; el.className = "plain-status"; }
+}
+
 function renderDetails(data) {
-  let html = "";
+  let html = `<div class="detail-grid">`;
   html += renderSection("CEVA", data.ceva);
   html += renderSection("Entry Summary", data.entry_summary);
+  html += `</div>`;
   html += renderPartsWorksheet(data.parts_worksheet);
   document.getElementById("output").innerHTML = html;
 }
 
 function renderSection(title, obj) {
-  let html = `<div class="section"><h3>${title}</h3><table>`;
-  for (const key in (obj || {})) {
+  if (!obj || !Object.keys(obj).length) return "";
+  let html = `<div class="detail-card"><h3>${title}</h3><table>`;
+  for (const key in obj) {
     html += `<tr><th>${key}</th><td>${safeCell(obj[key])}</td></tr>`;
   }
-  html += "</table></div>";
+  html += `</table></div>`;
   return html;
 }
 
-/**
- * renderPartsWorksheet
- *
- * The backend now always sends LineItems as a clean array of plain dicts:
- *   [{ Invoice_Seq: "SEQ 1", Invoice_Number: "42500097", Part_No: "6492804", ... }, ...]
- *
- * Each field value is a plain string — no [object Object].
- * For old docs, the backend applies _fix_parts_worksheet_line_items before
- * sending, so the frontend never needs to handle DI wrappers.
- *
- * Multi-value fields that DI joined with spaces are already deduped by the
- * backend (e.g. "COOLER CORE COOLER CORE" => "COOLER CORE").
- */
 function renderPartsWorksheet(obj) {
-  let html = `<div class="section"><h3>Parts Worksheet</h3>`;
-  html += `<p><strong>Supplier:</strong> ${safeCell(obj?.Supplier)}</p>`;
-
+  if (!obj) return "";
   let lineItems = obj?.LineItems;
 
-  // Backward-compat: if an old doc still slips through with DI wrapper,
-  // unwrap it client-side so it at least renders something.
   if (lineItems && !Array.isArray(lineItems) && lineItems.valueArray) {
     lineItems = lineItems.valueArray.map(x => {
       const vo = x.valueObject || x;
-      // Unwrap each field value
       const row = {};
       for (const k in vo) {
         const fv = vo[k];
-        if (fv && typeof fv === "object") {
-          // Try known value keys; fall back to content, then JSON
-          row[k] = fv.valueString ?? fv.valueNumber ?? fv.valueInteger
-                ?? fv.valueDate ?? fv.content ?? JSON.stringify(fv);
-        } else {
-          row[k] = fv ?? "";
-        }
+        row[k] = (fv && typeof fv === "object")
+          ? (fv.valueString ?? fv.valueNumber ?? fv.valueInteger ?? fv.valueDate ?? fv.content ?? JSON.stringify(fv))
+          : (fv ?? "");
       }
       return row;
     });
   }
 
+  let html = `<div class="card" style="margin-top:0;">
+    <div class="card-header">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--intel-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+      <span class="card-title">Parts Worksheet</span>
+      ${obj?.Supplier ? `<span class="supplier-badge">${safeCell(obj.Supplier)}</span>` : ""}
+    </div>`;
+
   if (Array.isArray(lineItems) && lineItems.length > 0) {
-    // Collect all field keys across all items (some items may have extra fields)
     const allKeys = [];
+    lineItems.forEach(item => Object.keys(item || {}).forEach(k => { if (!allKeys.includes(k)) allKeys.push(k); }));
+
+    html += `<div class="parts-full table-wrap" style="border:none; border-radius:0; max-height:400px;"><table>
+      <thead><tr>${allKeys.map(h => `<th>${h}</th>`).join("")}</tr></thead>
+      <tbody>`;
     lineItems.forEach(item => {
-      Object.keys(item || {}).forEach(k => {
-        if (!allKeys.includes(k)) allKeys.push(k);
-      });
+      html += `<tr>${allKeys.map(h => `<td>${safeCell(item?.[h])}</td>`).join("")}</tr>`;
     });
-
-    html += "<table><tr>";
-    allKeys.forEach(h => html += `<th>${h}</th>`);
-    html += "</tr>";
-
-    lineItems.forEach(item => {
-      html += "<tr>";
-      allKeys.forEach(h => {
-        const v = item ? item[h] : null;
-        html += `<td>${safeCell(v)}</td>`;
-      });
-      html += "</tr>";
-    });
-
-    html += "</table>";
+    html += `</tbody></table></div>`;
   } else {
-    html += `<p class="muted">No line items found.</p>`;
+    html += `<div class="empty">No line items found.</div>`;
   }
 
-  html += "</div>";
+  html += `</div>`;
   return html;
 }
 
-// initial load
+/* ── INIT ───────────────────────────────────────────────────── */
 refreshResults();
 </script>
 </body>
